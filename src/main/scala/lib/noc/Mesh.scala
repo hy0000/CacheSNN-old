@@ -2,7 +2,6 @@ package lib.noc
 
 import spinal.core._
 import spinal.lib._
-import sun.net.www.HeaderParser
 
 object Mesh {
   val xMax = 15
@@ -10,7 +9,7 @@ object Mesh {
   def apply(xSize:Int = xMax + 1,ySize:Int = yMax + 1 ) = new Mesh(xSize, ySize)
 }
 
-case class LocalIf(x: Int, y: Int) extends Bundle with IMasterSlave {
+case class NocLocalIf() extends Bundle with IMasterSlave {
   val pop, push = Stream Fragment Bits(32 bits)
   val headerError = Bool()
   override def asMaster() = {
@@ -59,8 +58,8 @@ class HeaderPacker(x:Int, y:Int, xSize:Int, ySize:Int) extends Component {
 class Mesh(xSize:Int, ySize:Int) extends Component {
   import NoCDirection._
 
-  val localIfs = Seq.tabulate(xSize, ySize){ (x, y) =>
-    slave(LocalIf(x, y))
+  val localIfs = Seq.tabulate(xSize, ySize){ (_,_) =>
+    slave(NocLocalIf())
   }
 
   for(localIf <- localIfs.flatten){

@@ -1,12 +1,14 @@
 package cachesnn
 
 import spinal.core._
-import cachesnn.AerConfig._
+import cachesnn.AerBus._
 import lib.float.BF16
+import spinal.lib.bus.bmb._
 
-object AerConfig {
-  val NEURON_ID_WIDTH = 16
-  val TIMESTAMP_WIDTH = 16
+object AerBus {
+  val timeStampWidth = 16
+  val weightWidth = 16
+  val stdpTimeWindowWidth = 16
 }
 
 object EventType extends SpinalEnum {
@@ -14,21 +16,11 @@ object EventType extends SpinalEnum {
 }
 
 class AerBase extends Bundle {
-  val neuronId = UInt(NEURON_ID_WIDTH bits)
-  val timestamp = UInt(TIMESTAMP_WIDTH bits)
+  //val neuronId = UInt(neuronIdWidth bits)
+  val timestamp = UInt(timeStampWidth bits)
 }
 
 class AerBus extends AerBase {
   val current = BF16
   val eventType = EventType
-}
-
-class StdpPipeBase extends Bundle {
-  val weight = BF16
-  val postNeuronId = UInt(NEURON_ID_WIDTH bits)
-  val offset = UInt(NEURON_ID_WIDTH bits)
-}
-
-class SpikeHis extends StdpPipeBase {
-  val ltpEvent = UInt(NEURON_ID_WIDTH bits)
 }
