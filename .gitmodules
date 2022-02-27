@@ -1,3 +1,6 @@
 [submodule "ext/SpinalHDL"]
 	path = ext/SpinalHDL
 	url = https://github.com/SpinalHDL/SpinalHDL.git
+[submodule "ext/SaxonSoc"]
+	path = ext/SaxonSoc
+	url = https://github.com/SpinalHDL/SaxonSoc.git
