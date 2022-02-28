@@ -15,7 +15,7 @@ lazy val root = (project in file(".")).
     ),
     name := "CacheSNN"
   ).dependsOn(
-  spinalHdlIdslPlugin, spinalHdlSim,spinalHdlCore, spinalHdlLib
+  spinalHdlIdslPlugin, spinalHdlSim,spinalHdlCore, spinalHdlLib,
 )
 lazy val spinalHdlIdslPlugin = ProjectRef(file("ext/SpinalHDL"), "idslplugin")
 lazy val spinalHdlSim = ProjectRef(file("ext/SpinalHDL"), "sim")

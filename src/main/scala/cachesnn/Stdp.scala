@@ -19,7 +19,11 @@ object Stdp {
   val bufferAddressWidth = neuronIdWidth>>(busDataWidth/stdpTimeWindowWidth)
   val addressRange = bufferAddressWidth downto 1
 }
-/*
+
+object Action extends SpinalEnum {
+  val queryOnly, queryInsert, insertOnly, update, busRead, busWrite = newElement()
+}
+
 class Axon extends Bundle {
   val weight = Bits(weightWidth bits)
   val postNeuronId = UInt(neuronIdWidth bits)
@@ -32,137 +36,144 @@ class Axon extends Bundle {
   }
 }
 
-object Action extends SpinalEnum {
-  val busRead, busWrite, fence1, fence2= newElement()
-  val preSpikeQuery, virtualQuery, update, postSpikeWrite = newElement()
-}
-
-trait Action {
-  val action = Action()
-}
-
-class PreSpikeCmd extends Bundle with Action{
+class PreSpikeCmd extends Bundle {
   val preNeuronId = UInt(neuronIdWidth bits)
+  val virtualSpike = Bool()
 }
-class PreSpikeRsp extends Bundle with Action{
+
+class PreSpikeRsp extends Bundle {
   val prePreSpikeTime = UInt(log2Up(stdpTimeWindowWidth) bits)
+  val virtualSpike = Bool()
 }
-class PostSpikeCmd extends Axon with Action
-class PostSpikeRsp extends Axon with Action{
+
+case class SpikeTableDataPath(p: BmbParameter) extends Bundle {
+  val address = UInt(p.access.addressWidth bits)
+  val data = Bits(p.access.dataWidth bits)
+  val mask = Bits(p.access.maskWidth bits)
+  val action = Action()
+  // below are bmb bus fields
+  val source = UInt(p.access.sourceWidth bits)
+  val context = Bits(p.access.contextWidth bits)
+
+  def neuronIdLow:UInt = mask(log2Up(p.access.dataWidth/stdpTimeWindowWidth)-1 downto 0).asUInt
+  def neuronId:UInt = address @@ neuronIdLow
+  def isUpdateContext:Bool = {
+    True
+  }
+  def dataDivided:Vec[Bits] = data.subdivideIn(stdpTimeWindowWidth bits)
+  def spikes:Bits = dataDivided(neuronIdLow)
+  def spikeInserted:Bits = spikes | B(1)
+  def spikeUpdated:Bits = spikes |<< 1
+}
+
+class PostSpikeRsp extends Axon{
   val postSpikeTime = UInt(log2Up(stdpTimeWindowWidth) bits)
 }
 
-class PreSpikeBuffer extends Component {
+class PreSpikeTable(p: BmbParameter, size:BigInt) extends Component {
   val io = new Bundle {
-    val cmd = slave Stream new PreSpikeCmd
-    val rsp = master Stream new PreSpikeRsp
-    val fence = master Stream new PreSpikeCmd
-    val bus = slave(Bmb(bmbParameter))
+    val queryCmd = slave Stream new PreSpikeCmd
+    val queryRsp = master Stream new PreSpikeRsp
+    val bus = slave(Bmb(p))
   }
 
-  case class DataPath() extends PreSpikeCmd {
-    val data = Bits(busDataWidth bits)
+  val spikeBuffer = Mem(Bits(32 bits), size/p.access.byteCount)
 
-    def spikes:Bits = {
-      preNeuronId(0) ? data(31 downto 16) | data(15 downto 0)
-    }
-  }
-
-  val addressCounter = Counter(bufferAddressWidth bits)
-  val spikeBuffer = Mem(Bits(32 bits), maxNeuronNum)
-
-  val cmdFilter = new Area {
-    val busy = Reg(Bool()) init False
-    val fence1 = io.cmd.action === Action.fence1
-    busy riseWhen io.cmd.fire && fence1
-    busy fallWhen addressCounter.willOverflow
-
-    val updateCmd = Stream(new PreSpikeCmd)
-    updateCmd.valid := busy
-    updateCmd.preNeuronId := addressCounter
-    updateCmd.action := Action.update
-    when(updateCmd.fire){
-      addressCounter.increment()
-    }
-    val queryCmd = io.cmd.throwWhen(fence1).haltWhen(busy)
-    val output = StreamArbiterFactory.lowerFirst.on(
-      Seq(updateCmd, queryCmd)
-    )
-  }
-
-  when(io.bus.cmd.fire){
-    when(io.bus.cmd.length+io.bus.cmd.address===addressCounter){
-      addressCounter.clear()
-    }otherwise{
-      addressCounter.increment()
-    }
-  }
-
-  val cmdFromCmdFilter = cmdFilter.output.translateWith{
-    val ret = DataPath()
-    ret.assignSomeByName(cmdFilter.output)
+  val cmdFromQuery = io.queryCmd.translateWith{
+    val ret = new SpikeTableDataPath(p)
+    ret.address := (io.queryCmd.preNeuronId >> p.access.wordRangeLength).resized
     ret.data := 0
+    // using mask to retain neuronId low bits
+    ret.mask := io.queryCmd.preNeuronId(p.access.wordRangeLength-1 downto 0).asBits.resized
+    ret.source := 0
+    ret.context := 0
+    when(io.queryCmd.virtualSpike){
+      ret.action := Action.queryOnly
+    }otherwise{
+      ret.action := Action.queryInsert
+    }
     ret
   }
+
   val cmdFromBus = io.bus.cmd.translateWith{
-    val ret = DataPath()
-    ret.data := io.bus.cmd.data
-    ret.preNeuronId := io.bus.cmd.address + addressCounter
-    ret.action := io.bus.cmd.isRead ? Action.busRead | Action.busWrite
+    val ret = SpikeTableDataPath(p)
+    ret.assignSomeByName(io.bus.cmd.fragment)
+    ret.address.removeAssignments()
+    ret.address := (io.queryCmd.preNeuronId >> p.access.wordRangeLength).resized
+    when(io.bus.cmd.isWrite){
+      ret.action := Action.busWrite
+    } elsewhen ret.isUpdateContext {
+      ret.action := Action.update
+    } otherwise{
+      ret.action := Action.busRead
+    }
     ret
   }
 
   val cmd = StreamArbiterFactory.lowerFirst.on(
-    Seq(cmdFromCmdFilter, cmdFromBus)
-  ).stage()
+    Seq(cmdFromBus, cmdFromQuery)
+  )
 
-  val (readRsp, axon) = {
-    val ret = StreamFork2(cmd)
+  val (busRsp, queryRsp, writeBack) = {
+    val cmdFork = StreamFork2(cmd)
     val readRsp = spikeBuffer.streamReadSync(
-      ret._1.translateWith(ret._1.preNeuronId(addressRange))
+      cmdFork._1.translateWith(cmdFork._1.address)
     )
-    val axon = ret._2.stage()
-    (readRsp, axon)
-  }
-
-  val output = StreamJoin(readRsp, axon).translateWith{
-    val ret = DataPath()
-    ret.assignSomeByName(axon)
-    when(ret.action===Action.busRead){
-      ret.data := readRsp.payload
+    val cmdStaged = cmdFork._2.stage()
+    val spikeReadOut = StreamJoin(readRsp, cmdStaged).translateWith{
+      val ret = SpikeTableDataPath(p)
+      ret.assignSomeByName(cmdStaged.payload)
+      when(cmdStaged.action=/=Action.busWrite){
+        ret.data := readRsp.payload
+      }
+      ret
     }
-    ret
+
+    val rspFork = StreamFork2(spikeReadOut)
+    (rspFork._1, rspFork._2, spikeReadOut.asFlow)
   }
 
-  val (toRsp, toBus, toFence) = {
+  val _ = new Area {
     import Action._
-    val selRsp = Seq(preSpikeQuery, virtualQuery, fence2)
-    val selBus = Seq(busRead, busWrite)
-    val selFence = Seq(fence1, update)
-    val sel = Seq(selRsp, selBus, selFence).map(
-      _.map(_===output.action).orR
-    )
 
-    val ret = StreamDemux(output, OHToUInt(sel), 3)
-    (ret(0), ret(1), ret(2))
-  }
+    io.queryRsp << queryRsp.takeWhen(
+      Seq(queryOnly, queryInsert).map(_===queryRsp.action).orR
+    ).translateWith{
+      val ret = new PreSpikeRsp
+      ret.virtualSpike := queryRsp.action===queryOnly
+      ret.prePreSpikeTime := OHToUInt(queryRsp.spikes)
+      ret
+    }
 
-  io.rsp << toRsp.translateWith{
-    val ret = new PreSpikeRsp
-    val oldSpikes = (toRsp.spikes>>1) ## B"0"
-    ret.prePreSpikeTime := OHToUInt(OHMasking.first(oldSpikes))
-    ret
-  }
+    io.bus.rsp << busRsp.takeWhen(
+      Seq(busRead, busWrite, update).map(_===busRsp.action).orR
+    ).translateWith{
+      val ret = io.bus.rsp.copy()
+      ret.assignSomeByName(busRsp.payload)
+      ret.setSuccess()
+      when(busRsp.isUpdateContext){
+        ret.data := busRsp.neuronId.asBits.resized
+        ret.data.msb := busRsp.spikes.msb
+      }otherwise{
+        ret.data := busRsp.data
+      }
+      ret
+    }.addFragmentLast(True)
 
-  io.bus.rsp << toBus.translateWith{
-    val ret = io.bus.rsp.copy()
-    ret.setSuccess()
-    ret.source := RegNext(io.bus.cmd, io.bus.cmd.ready)
-    ret.context := 0
-    when(toBus.action===Action.busRead){
-      ret.data := toBus.data
-    }otherwise{
-      ret.data := 0
+    spikeBuffer.writePortWithMask(p.access.maskWidth) << writeBack.takeWhen(
+      Seq(busWrite, queryInsert, update).map(_===writeBack.action).orR
+    ).translateWith{
+      val ret = MemWriteCmdWithMask(spikeBuffer, p.access.maskWidth)
+      ret.mask := writeBack.mask
+      ret.address := writeBack.address
+      ret.data := writeBack.data
+      val vData = ret.data.subdivideIn(stdpTimeWindowWidth bits)
+      when(writeBack.action===queryInsert){
+        vData(writeBack.neuronIdLow) := writeBack.spikeInserted
+      }elsewhen(writeBack.action===update){
+        vData(writeBack.neuronIdLow) := writeBack.spikeUpdated
+      }
+      ret
     }
   }
 }
@@ -179,195 +190,12 @@ class SpikeQueryPipe extends Axon{
   def prePreSpikeTime:UInt = data(log2Up(stdpTimeWindowWidth)-1 downto 0)
 }
 
-class SpikeQueryRsp extends SpikeQueryPipe{
-  val postSpikeTime = Bits(log2Up(stdpTimeWindowWidth) bits)
-}
-
 case class StdpEvent() extends Axon {
   val isLtp = Bool()
   val deltaT = UInt(log2Up(stdpTimeWindowWidth) bits)
 }
-*/
-class SpikeTableUpdater extends Component {
-  val io = new Bundle {
-
-  }
-}
-
 
 /*
-class PostSpikeBuffer(baseAddress: Int) extends  Component {
-  val io = new Bundle {
-    val queryCmd = slave(Stream(new PreSpikeQueryRsp))
-    val queryRsp = master(Stream(new SpikeQueryRsp))
-    val postSpike = slave(Stream(UInt(neuronIdWidth bits)))
-    val bus = slave(Bmb(bmbParameter))
-  }
-
-  //val busif = BusInterface(
-  //  io.bus.toWishbone(),
-  //  (baseAddress, 4 Byte)
-  //)
-  //val neuronNum = busif.newReg(doc="neuron num")
-  val neuronNum = Reg(UInt(16 bits)) init 0
-  val spikeBuffer = Mem(Bits(32 bits), maxNeuronNum)
-
-  val addrCounter = Counter(spikeBuffer.addressWidth bits)
-
-  val (queryFork, updateFork) = {
-    val cmdFork = StreamFork2(io.queryCmd)
-    (
-      cmdFork._1.throwWhen(io.queryCmd.fence),
-      cmdFork._2.takeWhen(io.queryCmd.fence)
-    )
-  }
-
-  val update = new Area{
-    val addressIncr = Counter(spikeBuffer.addressWidth bits)
-    val cmd = Stream(UInt(spikeBuffer.addressWidth bits))
-    val busy = Reg(Bool()) init False
-    busy riseWhen updateFork.fire
-    busy fallWhen addressIncr.willOverflow
-    when(cmd.fire){
-      addressIncr.increment()
-    }
-    cmd.valid := busy
-    cmd.payload := addressIncr
-    updateFork.ready := !busy //TODO: thinking
-  }
-
-  val readChannel = new Area {
-    class Pipe extends Axon with SpikeAction{
-      val address = UInt(spikeBuffer.addressWidth bits)
-      val data = Bits(32 bits)
-
-      def postSpikes: Bits = {
-        address(0) ? data(31 downto 16) | data(15 downto 0)
-      }
-    }
-
-    val readByQuery = queryFork.translateWith{
-      val ret = new Pipe()
-      ret.assignSomeByName(queryFork) // set the axon field
-      ret.address := queryFork.postNeuronId(neuronAddrRange)
-      ret.data := 0
-      ret
-    }
-    val readByBus = io.bus.cmd.translateWith{
-      val isRead = io.bus.cmd.isRead
-      val ret = new Pipe()
-      ret.setAxonDefaultValue()
-      ret.action := isRead ? ActionType.busRead | ActionType.busWrite
-      ret.address := io.bus.cmd.address(busAddrRange)
-      when(isRead){
-        ret.data := 0
-      }otherwise {
-        ret.data := io.bus.cmd.data
-      }
-      ret
-    }
-    val readByPostSpike = io.postSpike.translateWith{
-      val ret = new Pipe()
-      ret.setAxonDefaultValue()
-      ret.action := ActionType.writePostSpike
-      ret.address := io.postSpike.payload(neuronAddrRange)
-      ret.data := 0
-      ret
-    }
-    val readByUpdate = update.cmd.translateWith{
-      val ret = new Pipe()
-      ret.setAxonDefaultValue()
-      ret.action := ActionType.update
-      ret.address := update.cmd.payload
-      ret.data := 0
-      ret
-    }
-
-    val (spikes, axonInfo) = {
-      val readPorts = Seq(
-        readByUpdate,
-        readByPostSpike,
-        readByBus,
-        readByQuery
-      )
-      val (readCmd, axonInfo) = StreamFork2(
-        StreamArbiterFactory.lowerFirst.on(readPorts).stage(),
-        synchronous = true
-      )
-      val spikes = spikeBuffer.streamReadSync(
-        readCmd.translateWith(readCmd.address)
-      )
-      (spikes, axonInfo.stage())
-    }
-
-    val bufferRsp = StreamJoin(spikes, axonInfo).translateWith{
-      val ret = new Pipe
-      ret.assignSomeByName(axonInfo)
-      when(ret.action=/=ActionType.busWrite){
-        ret.data := spikes.payload
-      }
-      ret
-    }.s2mPipe()
-
-    val (queryRsp, busReadRsp) = {
-      val toBus   = U"0"
-      val toQuery = U"1"
-      val outPortsSel = (bufferRsp.action===ActionType.busRead) ? toBus | toQuery
-      val outPorts = StreamDemux(bufferRsp, outPortsSel, 2)
-
-      val busRsp = outPorts(toBus).translateWith{
-        val ret = io.bus.rsp.copy()
-        ret.setSuccess()
-        ret.data := outPorts(toBus).data
-        ret.source := RegNextWhen(io.bus.cmd.source, io.bus.cmd.ready)
-        ret.context := 0
-        ret
-      }.addFragmentLast(True) //TODO: ....
-
-      val queryRsp = outPorts(toQuery).translateWith{
-        val ret = new SpikeQueryRsp
-        ret.assignSomeByName(outPorts(toQuery))
-        ret.postSpikes := outPorts(toQuery).address(0) ?
-          outPorts(toQuery).data(31 downto 16) | outPorts(toQuery).data(15 downto 0)
-        ret
-      }
-      (queryRsp, busRsp)
-    }
-    io.queryRsp << queryRsp
-    io.bus.rsp << busReadRsp
-  }
-
-  val bufferRsp = readChannel.bufferRsp
-  spikeBuffer.writePortWithMask << bufferRsp.asFlow.takeWhen(
-    Seq(
-      ActionType.update,
-      ActionType.writePostSpike,
-      ActionType.busWrite
-    ).map(_===bufferRsp.action).orR
-  ).translateWith{
-    val ret = MemWriteCmdWithMask(spikeBuffer)
-    val address = bufferRsp.postNeuronId(neuronAddrRange)
-    val spikes1 = bufferRsp.data(31 downto 16)
-    val spikes0 = bufferRsp.data(15 downto 0)
-    val action = bufferRsp.action
-    when(action===ActionType.update){
-      ret.data := (spikes1 |<< 1) ##  (spikes0 |<< 1)
-      ret.mask := B"11"
-    }elsewhen(action===ActionType.writePostSpike){
-      ret.data := (spikes1 | B(1, 16 bits)) ## (spikes0 | B(1, 16 bits))
-      ret.mask := address(0) ? B"01" | B"10"
-    }elsewhen(action===ActionType.busWrite){
-      ret.data := spikes1 ## spikes0
-      ret.mask := B"11"
-    }otherwise{
-      ret.data := 0
-      ret.mask := B"00"
-    }
-    ret
-  }
-}
-
-
 class StdpCore extends Component {
   val io = new Bundle {
     val axon = Vec(slave(Stream(new Axon)), channels)
@@ -378,5 +206,6 @@ class StdpCore extends Component {
 }
 */
 object StdpVerilog extends App {
-  //SpinalVerilog(new PreSpikeBuffer)
+  //val p = BmbOnChipRam.busCapabilities(4 KiB, dataWidth = 32)
+  SpinalVerilog(new PreSpikeTable(bmbParameter, 4 KiB))
 }

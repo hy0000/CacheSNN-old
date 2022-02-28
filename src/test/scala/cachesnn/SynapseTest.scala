@@ -18,10 +18,10 @@ class SynapseTest extends AnyFunSuite{
 
       //dut.io.out0.cmd.ready #= true
       dut.io.in.cmd.source #= 1
-      dut.io.in.cmd.address #= 100
+      dut.io.in.cmd.address #= 0
       dut.io.in.cmd.opcode #= 0
-      dut.io.in.cmd.length #= 8
-      dut.io.in.cmd.data #= 100
+      dut.io.in.cmd.length #= 64
+      dut.io.in.cmd.data #= 0xF
       dut.io.in.cmd.mask #= 0xF
       dut.io.in.cmd.context #= 0
       dut.io.in.cmd.valid #= true
