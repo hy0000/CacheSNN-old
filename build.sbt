@@ -15,12 +15,11 @@ lazy val root = (project in file(".")).
     ),
     name := "CacheSNN"
   ).dependsOn(
-  spinalHdlIdslPlugin, spinalHdlSim,spinalHdlCore, spinalHdlLib, naxRiscv
+  spinalHdlIdslPlugin, spinalHdlSim,spinalHdlCore, spinalHdlLib
 )
 lazy val spinalHdlIdslPlugin = ProjectRef(file("ext/SpinalHDL"), "idslplugin")
 lazy val spinalHdlSim = ProjectRef(file("ext/SpinalHDL"), "sim")
 lazy val spinalHdlCore = ProjectRef(file("ext/SpinalHDL"), "core")
 lazy val spinalHdlLib = ProjectRef(file("ext/SpinalHDL"), "lib")
-lazy val naxRiscv = RootProject(file("ext/NaxRiscv"))
 
 fork := true

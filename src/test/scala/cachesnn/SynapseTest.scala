@@ -12,11 +12,11 @@ class SynapseTest extends AnyFunSuite{
   test("bmb test"){
     compiled.doSim{ dut =>
       dut.clockDomain.forkStimulus(2)
-      dut.io.out0.rsp.valid #= false
-      dut.io.out0.rsp.source #= 1
-      dut.io.out0.rsp.opcode #= 0
+      //dut.io.out0.rsp.valid #= false
+      //dut.io.out0.rsp.source #= 1
+      //dut.io.out0.rsp.opcode #= 0
 
-      dut.io.out0.cmd.ready #= true
+      //dut.io.out0.cmd.ready #= true
       dut.io.in.cmd.source #= 1
       dut.io.in.cmd.address #= 100
       dut.io.in.cmd.opcode #= 0
@@ -32,10 +32,10 @@ class SynapseTest extends AnyFunSuite{
         dut.io.in.cmd.ready.toBoolean
       )
       dut.io.in.cmd.valid #= false
-      dut.clockDomain.waitRisingEdgeWhere(
-        dut.io.out0.rsp.valid.toBoolean
-      )
-      dut.io.out0.rsp.valid #= true
+      //dut.clockDomain.waitRisingEdgeWhere(
+      //  dut.io.out0.rsp.valid.toBoolean
+      //)
+      //dut.io.out0.rsp.valid #= true
       dut.clockDomain.waitRisingEdge(100)
     }
   }
