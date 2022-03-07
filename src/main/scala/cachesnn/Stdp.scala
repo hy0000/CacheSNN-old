@@ -6,6 +6,7 @@ import spinal.lib._
 import cachesnn.AerBus._
 import cachesnn.Synapse._
 import cachesnn.Stdp._
+import spinal.lib.bus.bmb
 import spinal.lib.bus.bmb.BmbParameter.BurstAlignement.WORD
 import spinal.lib.bus.bmb._
 import spinal.lib.bus.regif.BusInterface
@@ -14,95 +15,102 @@ object Stdp {
   val busDataWidth = 32
   val spikeBufferSize = 4 KiB
   val stdpFpuMemSize = 4 KiB
-  val maxNeuronNum = spikeBufferSize/stdpTimeWindowWidth
+  val neuronByteCount = 2
+  val maxNeuronNum = spikeBufferSize/neuronByteCount
   val neuronIdWidth = log2Up(maxNeuronNum)
-  val bufferAddressWidth = neuronIdWidth>>(busDataWidth/stdpTimeWindowWidth)
-  val addressRange = bufferAddressWidth downto 1
 }
 
 object Action extends SpinalEnum {
   val queryOnly, queryInsert, insertOnly, update, busRead, busWrite = newElement()
 }
 
-class Axon extends Bundle {
-  val weight = Bits(weightWidth bits)
-  val postNeuronId = UInt(neuronIdWidth bits)
-  val offset = UInt(neuronIdWidth bits)
-
-  def setAxonDefaultValue(): Unit ={
-    weight := 0
-    postNeuronId := 0
-    offset := 0
-  }
+trait Spikes extends Bundle {
+  val spikes = Bits(stdpTimeWindowWidth bits)
 }
 
-class PreSpikeCmd extends Bundle {
-  val preNeuronId = UInt(neuronIdWidth bits)
-  val virtualSpike = Bool()
+class SpikeQueryEvent(isPost:Boolean) extends Bundle {
+  val neuronId = UInt(neuronIdWidth bits)
+  val virtualSpike = ifGen(!isPost)(Bool())
+  val offset = ifGen(isPost)(UInt(neuronIdWidth bits))
+  val weight = ifGen(isPost)(Bits(weightWidth bits))
 }
 
-class PreSpikeRsp extends Bundle {
-  val prePreSpikeTime = UInt(log2Up(stdpTimeWindowWidth) bits)
-  val virtualSpike = Bool()
-}
+case class SpikesRsp(isPost:Boolean) extends SpikeQueryEvent(isPost) with Spikes
 
-case class SpikeTableDataPath(p: BmbParameter) extends Bundle {
-  val address = UInt(p.access.addressWidth bits)
-  val data = Bits(p.access.dataWidth bits)
-  val mask = Bits(p.access.maskWidth bits)
-  val action = Action()
-  // below are bmb bus fields
-  val source = UInt(p.access.sourceWidth bits)
-  val context = Bits(p.access.contextWidth bits)
-
-  def neuronIdLow:UInt = mask(log2Up(p.access.dataWidth/stdpTimeWindowWidth)-1 downto 0).asUInt
-  def neuronId:UInt = address @@ neuronIdLow
-  def isUpdateContext:Bool = {
-    True
-  }
-  def dataDivided:Vec[Bits] = data.subdivideIn(stdpTimeWindowWidth bits)
-  def spikes:Bits = dataDivided(neuronIdLow)
-  def spikeInserted:Bits = spikes | B(1)
-  def spikeUpdated:Bits = spikes |<< 1
-}
-
-class PostSpikeRsp extends Axon{
-  val postSpikeTime = UInt(log2Up(stdpTimeWindowWidth) bits)
-}
-
-class PreSpikeTable(p: BmbParameter, size:BigInt) extends Component {
+class SpikesTable(p: BmbParameter, size:BigInt, isPost:Boolean) extends Component {
   val io = new Bundle {
-    val queryCmd = slave Stream new PreSpikeCmd
-    val queryRsp = master Stream new PreSpikeRsp
+    val queryCmd = slave Stream new SpikeQueryEvent(isPost)
+    val queryRsp = master Stream new SpikesRsp(isPost)
     val bus = slave(Bmb(p))
   }
 
-  val spikeBuffer = Mem(Bits(32 bits), size/p.access.byteCount)
+  val spikeRam = Mem(Bits(32 bits), size/p.access.byteCount)
+
+  case class SpikesTableDataPath(p: BmbParameter, isPost:Boolean) extends Bundle {
+    val address = UInt(p.access.addressWidth-p.access.wordRangeLength bits)
+    val neuronIdLow = UInt(log2Up(neuronByteCount) bits)
+    val data = Bits(p.access.dataWidth bits)
+    val mask = Bits(p.access.maskWidth bits)
+    val action = Action()
+    // below are bmb bus fields
+    val source = UInt(p.access.sourceWidth bits)
+    val context = Bits(p.access.contextWidth bits)
+    // below are axon fields
+    val offset = ifGen(isPost)(UInt(neuronIdWidth bits))
+    val weight = ifGen(isPost)(Bits(weightWidth bits))
+
+    def neuronId:UInt = address @@ neuronIdLow
+    def isEffectiveContext:Bool = 0=/=extractSrcContext(context)
+    def dataDivided:Vec[Bits] = data.subdivideIn(stdpTimeWindowWidth bits)
+    def spikes:Bits = dataDivided(neuronIdLow)
+    def spikesDo(action: Bits => Bits): Bits = dataDivided.map(action).asBits()
+    def setMaskByNeuronIdLow(): Unit ={
+      val m = B((1<<neuronByteCount)-1, neuronByteCount bits)
+      mask := (m<<(neuronIdLow*2)).resized
+    }
+  }
 
   val cmdFromQuery = io.queryCmd.translateWith{
-    val ret = new SpikeTableDataPath(p)
-    ret.address := (io.queryCmd.preNeuronId >> p.access.wordRangeLength).resized
+    val ret = SpikesTableDataPath(p, isPost)
+    ret.assignSomeByName(io.queryCmd.payload)
+    ret.address := io.queryCmd.neuronId.dropLow(log2Up(neuronByteCount)).asUInt
+    ret.neuronIdLow := io.queryCmd.neuronId.resized
+    ret.setMaskByNeuronIdLow()
     ret.data := 0
-    // using mask to retain neuronId low bits
-    ret.mask := io.queryCmd.preNeuronId(p.access.wordRangeLength-1 downto 0).asBits.resized
-    ret.source := 0
     ret.context := 0
-    when(io.queryCmd.virtualSpike){
+    ret.source := 0
+    if(isPost){
       ret.action := Action.queryOnly
-    }otherwise{
-      ret.action := Action.queryInsert
+    }else{
+      when(io.queryCmd.virtualSpike){
+        ret.action := Action.queryOnly
+      }otherwise{
+        ret.action := Action.queryInsert
+      }
     }
     ret
   }
 
   val cmdFromBus = io.bus.cmd.translateWith{
-    val ret = SpikeTableDataPath(p)
+    val ret = SpikesTableDataPath(p, isPost)
     ret.assignSomeByName(io.bus.cmd.fragment)
     ret.address.removeAssignments()
-    ret.address := (io.queryCmd.preNeuronId >> p.access.wordRangeLength).resized
+    ret.address := io.bus.cmd.address.dropLow(p.access.wordRangeLength).asUInt
+    ret.neuronIdLow := io.bus.cmd.address.resized
+    if(isPost){
+      ret.weight := 0
+      ret.offset := 0
+    }
     when(io.bus.cmd.isWrite){
       ret.action := Action.busWrite
-    } elsewhen ret.isUpdateContext {
+      if(isPost){
+        when(ret.isEffectiveContext){
+          ret.action := Action.insertOnly
+          ret.address := io.bus.cmd.address.dropLow(log2Up(neuronByteCount)).asUInt.resized
+          ret.setMaskByNeuronIdLow()
+        }
+      }
+    } elsewhen ret.isEffectiveContext{
       ret.action := Action.update
     } otherwise{
       ret.action := Action.busRead
@@ -115,15 +123,15 @@ class PreSpikeTable(p: BmbParameter, size:BigInt) extends Component {
   )
 
   val (busRsp, queryRsp, writeBack) = {
-    val cmdFork = StreamFork2(cmd)
-    val readRsp = spikeBuffer.streamReadSync(
-      cmdFork._1.translateWith(cmdFork._1.address)
+    val (readCmd, pass) = StreamFork2(cmd)
+    val readRsp = spikeRam.streamReadSync(
+      readCmd.translateWith(readCmd.address)
     )
-    val cmdStaged = cmdFork._2.stage()
-    val spikeReadOut = StreamJoin(readRsp, cmdStaged).translateWith{
-      val ret = SpikeTableDataPath(p)
-      ret.assignSomeByName(cmdStaged.payload)
-      when(cmdStaged.action=/=Action.busWrite){
+    val passStaged = pass.stage()
+    val spikeReadOut = StreamJoin(readRsp, passStaged).translateWith{
+      val ret = SpikesTableDataPath(p, isPost)
+      ret.assignSomeByName(passStaged.payload)
+      when(passStaged.action=/=Action.busWrite){
         ret.data := readRsp.payload
       }
       ret
@@ -139,73 +147,105 @@ class PreSpikeTable(p: BmbParameter, size:BigInt) extends Component {
     io.queryRsp << queryRsp.takeWhen(
       Seq(queryOnly, queryInsert).map(_===queryRsp.action).orR
     ).translateWith{
-      val ret = new PreSpikeRsp
-      ret.virtualSpike := queryRsp.action===queryOnly
-      ret.prePreSpikeTime := OHToUInt(queryRsp.spikes)
+      val ret = SpikesRsp(isPost)
+      ret.assignSomeByName(queryRsp.payload)
+      ret.spikes := queryRsp.spikes
+      ret.neuronId := queryRsp.neuronId
+      if(!isPost){
+        ret.virtualSpike := queryRsp.action===queryOnly
+        ret.spikes(0) := !ret.virtualSpike
+      }
       ret
     }
 
     io.bus.rsp << busRsp.takeWhen(
-      Seq(busRead, busWrite, update).map(_===busRsp.action).orR
+      Seq(busRead, busWrite, update, insertOnly).map(_===busRsp.action).orR
     ).translateWith{
       val ret = io.bus.rsp.copy()
       ret.assignSomeByName(busRsp.payload)
       ret.setSuccess()
-      when(busRsp.isUpdateContext){
-        ret.data := busRsp.neuronId.asBits.resized
-        ret.data.msb := busRsp.spikes.msb
-      }otherwise{
-        ret.data := busRsp.data
-      }
       ret
     }.addFragmentLast(True)
 
-    spikeBuffer.writePortWithMask(p.access.maskWidth) << writeBack.takeWhen(
-      Seq(busWrite, queryInsert, update).map(_===writeBack.action).orR
+    spikeRam.writePortWithMask(p.access.maskWidth) << writeBack.takeWhen(
+      Seq(busWrite, queryInsert, update, insertOnly).map(_===writeBack.action).orR
     ).translateWith{
-      val ret = MemWriteCmdWithMask(spikeBuffer, p.access.maskWidth)
+      val ret = MemWriteCmdWithMask(spikeRam, p.access.maskWidth)
       ret.mask := writeBack.mask
       ret.address := writeBack.address
-      ret.data := writeBack.data
-      val vData = ret.data.subdivideIn(stdpTimeWindowWidth bits)
       when(writeBack.action===queryInsert){
-        vData(writeBack.neuronIdLow) := writeBack.spikeInserted
+        ret.data := writeBack.spikesDo(spikes => spikes | B(1))
+      }elsewhen(writeBack.action===insertOnly){
+        ret.data := writeBack.spikesDo(spikes => spikes | B(2))
       }elsewhen(writeBack.action===update){
-        vData(writeBack.neuronIdLow) := writeBack.spikeUpdated
+        ret.data := writeBack.spikesDo(spikes => spikes |<< 1)
+      }otherwise{
+        ret.data := writeBack.data
       }
       ret
     }
   }
 }
 
-class SpikeQueryPipe extends Axon{
-  val data = UInt(32 bits)
-
-  // when preSpikeQuery and virtualQuery at preSpikeTable
-  def preNeuronId:UInt = data(neuronIdWidth downto 0)
-  // when update
-  def address:UInt = data(bufferAddressWidth downto 0)
-  // when bus
-  def length:UInt  = data(bufferAddressWidth downto 0)
-  def prePreSpikeTime:UInt = data(log2Up(stdpTimeWindowWidth)-1 downto 0)
+case class StdpEvent() extends SpikeQueryEvent(true){
+  val isLtd, isLtp = Bool()
+  val ltdDeltaT, ltpDeltaT = UInt(log2Up(stdpTimeWindowWidth) bits)
+  val preNeuronId = UInt(neuronIdWidth bits)
+  def postNeuronId:UInt = neuronId
 }
 
-case class StdpEvent() extends Axon {
-  val isLtp = Bool()
-  val deltaT = UInt(log2Up(stdpTimeWindowWidth) bits)
-}
-
-/*
-class StdpCore extends Component {
+class StdpEventGen extends Component {
   val io = new Bundle {
-    val axon = Vec(slave(Stream(new Axon)), channels)
-    val preSpikeCmd = slave Stream new PreSpikeCmd
-    val fenceAck = master Stream new PreSpikeCmd
-    val events = Vec(master(Stream(StdpEvent())), channels)
+    val preSpikes = slave Stream SpikesRsp(isPost = false)
+    val postSpikes = slave Stream SpikesRsp(isPost = true)
+    val stdpEvent = master Stream StdpEvent()
+  }
+
+  case class OhSpikes() extends SpikeQueryEvent(true){
+    val ohPrePreSpikes = Bits(stdpTimeWindowWidth bits)
+    val ohLtpPostSpikes = Bits(stdpTimeWindowWidth bits)
+    val ohLtdPostSpikes = Bits(stdpTimeWindowWidth bits)
+    override val virtualSpike = Bool()
+    val preNeuronId = UInt(neuronIdWidth bits)
+  }
+
+  val ohSpikes = StreamJoin(io.preSpikes, io.postSpikes).translateWith{
+    val ret = OhSpikes()
+    ret.assignSomeByName(io.postSpikes.payload)
+    val ohPrePreSpikes = OHMasking.first(io.preSpikes.spikes.dropLow(1)) ## B"0"
+    val ppsMask = (ohPrePreSpikes.asUInt-1).asBits | ohPrePreSpikes
+    val postSpikeMasked = io.postSpikes.spikes & ppsMask
+    ret.ohPrePreSpikes := ohPrePreSpikes
+    ret.ohLtpPostSpikes := OHMasking.roundRobin(
+      postSpikeMasked.reversed, (ohPrePreSpikes<<1).reversed
+    ).reversed
+    ret.ohLtdPostSpikes := OHMasking.first(postSpikeMasked)
+    ret.virtualSpike := io.preSpikes.virtualSpike
+    ret.preNeuronId := io.preSpikes.neuronId
+    ret
+  }.stage()
+
+  io.stdpEvent <-< ohSpikes.translateWith {
+    val ret = StdpEvent()
+    ret.assignSomeByName(ohSpikes.payload)
+    val prePreSpikeTime = OHToUInt(ohSpikes.ohPrePreSpikes)
+    ret.isLtd := ohSpikes.ohLtdPostSpikes.orR && (!ohSpikes.virtualSpike)
+    ret.isLtp := ohSpikes.ohLtpPostSpikes.orR
+    when(ret.isLtp){
+      ret.ltpDeltaT := prePreSpikeTime - OHToUInt(ohSpikes.ohLtpPostSpikes)
+    }otherwise{
+      ret.ltpDeltaT := 0
+    }
+    when(ret.isLtd){
+      ret.ltdDeltaT := OHToUInt(ohSpikes.ohLtdPostSpikes)
+    }otherwise{
+      ret.ltdDeltaT := 0
+    }
+    ret
   }
 }
-*/
+
 object StdpVerilog extends App {
-  //val p = BmbOnChipRam.busCapabilities(4 KiB, dataWidth = 32)
-  SpinalVerilog(new PreSpikeTable(bmbParameter, 4 KiB))
+  //SpinalVerilog(new SpikesTable(bmbParameter, 4 KiB, false))
+  SpinalVerilog(new StdpEventGen)
 }

@@ -14,13 +14,19 @@ object Synapse {
 
   val channels = 4
   val bmbParameter = BmbParameter(
-    addressWidth = 10,
+    addressWidth = 12,
     dataWidth = 32,
     sourceWidth = 2,
-    contextWidth = 0,
+    contextWidth = 1,
     lengthWidth = 8,
     alignment = BmbParameter.BurstAlignement.WORD
   )
+
+  def extractSrcContext(context: Bits):Bits = {
+    val h = context.getWidth - 1
+    val l = context.getWidth - bmbParameter.access.contextWidth
+    context(h downto l)
+  }
 }
 
 class Synapse extends Component {

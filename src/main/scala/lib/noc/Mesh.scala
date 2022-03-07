@@ -142,5 +142,5 @@ class Mesh(xSize:Int, ySize:Int) extends Component {
 }
 
 object MeshVerilog extends App {
-  SpinalVerilog(new Mesh(2, 8))
+  SpinalVerilog(new Mesh(4, 4))
 }

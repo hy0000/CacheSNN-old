@@ -26,6 +26,7 @@ class SynapseTest extends AnyFunSuite{
       dut.io.in.cmd.context #= 0
       dut.io.in.cmd.valid #= true
       dut.io.in.cmd.last #= true
+      dut.io.in.cmd.context #= 0
       dut.io.in.rsp.ready #= true
 
       dut.clockDomain.waitRisingEdgeWhere(
