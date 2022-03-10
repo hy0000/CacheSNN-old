@@ -2,7 +2,7 @@ package cachesnn
 
 import spinal.core._
 import spinal.lib._
-import cachesnn.Synapse.bmbParameter
+import cachesnn.Synapse.{bmbParameter, preSpikeTableSize}
 import lib.noc.NocLocalIf
 import spinal.core.fiber.Handle
 import spinal.lib.bus.bmb._
@@ -10,8 +10,18 @@ import spinal.lib.bus.misc.SizeMapping
 import lib.saxon._
 
 object Synapse {
-  import cachesnn.Stdp._
 
+  val threads = 2
+  val postSpikeTableSize = 4 KiB
+  val stdpTimeWindowBytes = 2
+  val postNeuronPreThread = postSpikeTableSize/stdpTimeWindowBytes/threads
+  val cacheSize = 1 MiB
+  val sparsity = 4
+  val synapseDataByte = 4
+  val cacheLineSize = postNeuronPreThread/sparsity*synapseDataByte
+  val firingRate = 4
+  val preNeuron = cacheSize/cacheLineSize*firingRate
+  val preSpikeTableSize = preNeuron*stdpTimeWindowBytes
   val channels = 4
   val bmbParameter = BmbParameter(
     addressWidth = 12,
@@ -70,6 +80,6 @@ class Synapse extends Component {
 }
 
 object SynapseVerilog extends App {
-  SpinalVerilog(new Synapse)
+  println(preSpikeTableSize)
 }
 
