@@ -14,12 +14,13 @@ lazy val root = (project in file(".")).
       "org.yaml" % "snakeyaml" % "1.8"
     ),
     name := "CacheSNN"
-  ).dependsOn(
-  spinalHdlIdslPlugin, spinalHdlSim,spinalHdlCore, spinalHdlLib,
+  )
 )
-lazy val spinalHdlIdslPlugin = ProjectRef(file("ext/SpinalHDL"), "idslplugin")
-lazy val spinalHdlSim = ProjectRef(file("ext/SpinalHDL"), "sim")
-lazy val spinalHdlCore = ProjectRef(file("ext/SpinalHDL"), "core")
-lazy val spinalHdlLib = ProjectRef(file("ext/SpinalHDL"), "lib")
+
+libraryDependencies ++= Seq(
+  "com.github.spinalhdl" % "spinalhdl-core_2.11" % "latest.release",
+  "com.github.spinalhdl" % "spinalhdl-lib_2.11" % "latest.release",
+  compilerPlugin("com.github.spinalhdl" % "spinalhdl-idsl-plugin_2.11" % "latest.release")
+)
 
 fork := true
