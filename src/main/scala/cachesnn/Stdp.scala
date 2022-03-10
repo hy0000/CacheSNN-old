@@ -167,10 +167,10 @@ class SpikesTable(p: BmbParameter, size:BigInt, isPost:Boolean) extends Componen
       ret
     }.addFragmentLast(True)
 
-    spikeRam.writePortWithMask(p.access.maskWidth) << writeBack.takeWhen(
+    spikeRam.writePortWithMask << writeBack.takeWhen(
       Seq(busWrite, queryInsert, update, insertOnly).map(_===writeBack.action).orR
     ).translateWith{
-      val ret = MemWriteCmdWithMask(spikeRam, p.access.maskWidth)
+      val ret = MemWriteCmdWithMask(spikeRam)
       ret.mask := writeBack.mask
       ret.address := writeBack.address
       when(writeBack.action===queryInsert){

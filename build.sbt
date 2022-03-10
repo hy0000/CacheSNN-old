@@ -1,26 +1,17 @@
-val spinalVersion = "1.6.5"
+ThisBuild / version := "1.0"
+ThisBuild / scalaVersion := "2.11.12"
+ThisBuild / organization := "org.example"
 
-lazy val root = (project in file(".")).
-  settings(
-    inThisBuild(List(
-      organization := "uestc-vicbic",
-      scalaVersion := "2.11.12",
-      version      := "2.0.0"
-    )),
-    scalacOptions +=  s"-Xplugin:${new File(baseDirectory.value + s"/ext/SpinalHDL/idslplugin/target/scala-2.11/spinalhdl-idsl-plugin_2.11-$spinalVersion.jar")}",
-    scalacOptions += s"-Xplugin-require:idsl-plugin",
-    libraryDependencies ++= Seq(
-      "org.scalatest" %% "scalatest" % "3.2.5",
-      "org.yaml" % "snakeyaml" % "1.8"
-    ),
-    name := "CacheSNN"
+val spinalVersion = "1.6.4"
+val spinalCore = "com.github.spinalhdl" %% "spinalhdl-core" % spinalVersion
+val spinalLib = "com.github.spinalhdl" %% "spinalhdl-lib" % spinalVersion
+val spinalIdslPlugin = compilerPlugin("com.github.spinalhdl" %% "spinalhdl-idsl-plugin" % spinalVersion)
+val scalaTest = "org.scalatest" % "scalatest_2.11" % "2.2.1"
+
+lazy val mylib = (project in file("."))
+  .settings(
+    name := "cacheSNN",
+    libraryDependencies ++= Seq(scalaTest, spinalCore, spinalLib, spinalIdslPlugin)
   )
-)
-
-libraryDependencies ++= Seq(
-  "com.github.spinalhdl" % "spinalhdl-core_2.11" % "latest.release",
-  "com.github.spinalhdl" % "spinalhdl-lib_2.11" % "latest.release",
-  compilerPlugin("com.github.spinalhdl" % "spinalhdl-idsl-plugin_2.11" % "latest.release")
-)
 
 fork := true
