@@ -9,6 +9,9 @@ import spinal.lib.bus.bmb._
 import spinal.lib.bus.misc.SizeMapping
 import lib.saxon._
 
+import scala.annotation.tailrec
+import scala.math.log10
+
 object Synapse {
 
   val threads = 2
@@ -78,8 +81,3 @@ class Synapse extends Component {
   //interconnect.addConnection(m, s)
   interconnect.addConnection(m, ramA.ctrl)
 }
-
-object SynapseVerilog extends App {
-  println(preSpikeTableSize)
-}
-

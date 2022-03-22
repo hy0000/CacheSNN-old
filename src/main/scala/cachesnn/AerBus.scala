@@ -15,12 +15,8 @@ object EventType extends SpinalEnum {
   val preSpikeEvent, postSpikeEvent, currentEvent = newElement()
 }
 
-class AerBase extends Bundle {
-  //val neuronId = UInt(neuronIdWidth bits)
-  val timestamp = UInt(timeStampWidth bits)
-}
-
-class AerBus extends AerBase {
-  val current = BF16
-  val eventType = EventType
+class AerBus(nidWidth:Int, offsetWidth: Int, lengthWidth:Int) extends Bundle {
+  val nid = UInt(nidWidth bits)
+  val offset = UInt(offsetWidth bits)
+  val length = UInt(lengthWidth bits)
 }
