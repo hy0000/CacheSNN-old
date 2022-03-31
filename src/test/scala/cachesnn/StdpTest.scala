@@ -348,29 +348,28 @@ class StdpEventGenTest extends AnyFunSuite {
     SimConfig.withWave.compile(new StdpEventGen).doSim{ dut=>
       dut.clockDomain.forkStimulus(2)
       SimTimeout(1000000)
-      val (_, preSpikeQueue) = StreamDriver.queue(dut.io.preSpikes, dut.clockDomain)
-      val (_, postSpikeQueue) = StreamDriver.queue(dut.io.postSpikes, dut.clockDomain)
       val virtualEvent = StdpEventSim.virtualEvent()
       val ltdOnlyEvent = StdpEventSim.ltdEvent()
       val stdpEvent = StdpEventSim.stdpEvent(nTestCase)
       val events = virtualEvent ++ ltdOnlyEvent ++ stdpEvent
+      val (_, eventCmdQueue) = StreamDriver.queue(dut.io.event, dut.clockDomain)
+      val stdpEventQueue = mutable.Queue[StdpEventSim]()
       for(e <- events){
         val s = e.genSourceSpikes()
-        preSpikeQueue.enqueue{ cmd=>
-          cmd.virtualSpike #= s.virtualSpike
-          cmd.spikes #= s.preSpike
+        eventCmdQueue.enqueue{ _=>
+          dut.io.virtual #= s.virtualSpike
+          dut.io.preSpikes #= s.preSpike
+          dut.io.postSpikes #= s.postSpike
         }
-        postSpikeQueue.enqueue{ cmd=>
-          cmd.spikes #= s.postSpike
-        }
+        stdpEventQueue.enqueue(e)
       }
-      dut.io.stdpEvent.ready #= true
-      for(e <- events){
-        dut.clockDomain.waitRisingEdgeWhere(dut.io.stdpEvent.valid.toBoolean)
-        assert(dut.io.stdpEvent.isLtp.toBoolean==e.isLtp)
-        assert(dut.io.stdpEvent.isLtd.toBoolean==e.isLtd)
-        assert(dut.io.stdpEvent.ltdDeltaT.toInt==e.ltdDeltaT)
-        assert(dut.io.stdpEvent.ltpDeltaT.toInt==e.ltpDeltaT)
+
+      StreamMonitor(dut.io.synapseEvent, dut.clockDomain){ stdpEvent =>
+        val e = stdpEventQueue.dequeue()
+        assert(stdpEvent.isLtp.toBoolean==e.isLtp)
+        assert(stdpEvent.isLtd.toBoolean==e.isLtd)
+        assert(stdpEvent.ltdDeltaT.toInt==e.ltdDeltaT)
+        assert(stdpEvent.ltpDeltaT.toInt==e.ltpDeltaT)
       }
     }
   }

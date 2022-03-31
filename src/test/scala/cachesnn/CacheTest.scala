@@ -1,14 +1,19 @@
 package cachesnn
 
+import cachesnn.Synapse.{cacheAxi4Config, spikeTableBmbParameter}
 import org.scalatest.funsuite.AnyFunSuite
 import spinal.core._
 import spinal.lib._
 import spinal.core.sim._
-import spinal.lib.bus.amba4.axi.Axi4WriteOnly
+import spinal.lib.bus.amba4.axi._
 import spinal.lib.bus.amba4.axi.sim._
+import spinal.lib.bus.bmb.Bmb
+import spinal.lib.bus.bmb.sim.BmbMemoryAgent
 import spinal.lib.bus.misc.SizeMapping
-object CacheTest {
+import spinal.lib.sim.{StreamDriver, StreamReadyRandomizer}
 
+import scala.util.Random
+object CacheTest {
 }
 
 class BankTest extends AnyFunSuite {
@@ -27,104 +32,138 @@ class BankTest extends AnyFunSuite {
     io.w.toFlow >> bank.writePort
   }
 
-  test("uram bank wave"){
-    SimConfig.withWave.compile(new UramBankInst).doSim{dut=>
+  def write(dut:UramBankInst, n:Int): Unit ={
+    dut.io.r.cmd.valid #= false
+    dut.io.w.valid #= true
+    dut.io.w.mask #= 0xFF
+    for(i <- 0 until n){
+      dut.io.w.address #= i
+      dut.io.w.data #= i
+      dut.clockDomain.waitRisingEdge()
+    }
+    dut.io.w.valid #= false
+  }
+
+  def read(dut:UramBankInst, n:Int): Unit ={
+    dut.io.r.cmd.valid #= true
+    for(i <- 0 until n){
+      dut.io.r.cmd.payload #= i
+      dut.clockDomain.waitSamplingWhere(dut.io.r.cmd.ready.toBoolean)
+    }
+    dut.io.r.cmd.valid #= false
+  }
+
+  test("access test"){
+    SimConfig.compile(new UramBankInst).doSim{dut=>
       dut.clockDomain.forkStimulus(2)
       dut.io.r.rsp.ready #= true
+      fork {write(dut, 1024)}
+      dut.clockDomain.waitRisingEdge()
+      fork {read(dut, 1024)}
+
+      dut.clockDomain.waitSamplingWhere(
+        dut.io.r.rsp.valid.toBoolean
+      )
       for(i <- 0 until 1024){
-        dut.io.w.address #= i
-        dut.io.w.valid #= true
-        dut.io.w.data #= i
-        dut.io.w.mask #= 0xFF
+        assert(i==dut.io.r.rsp.payload.toBigInt)
+        assert(dut.io.r.rsp.valid.toBoolean)
         dut.clockDomain.waitRisingEdge()
-        dut.io.r.cmd.valid #= true
-        dut.io.r.cmd.payload #= i
+      }
+    }
+  }
+
+  test("back pressure"){
+    SimConfig.compile(new UramBankInst).doSim{dut=>
+      dut.clockDomain.forkStimulus(2)
+      SimTimeout(10000)
+      dut.io.r.rsp.ready #= true
+      fork {write(dut, 40)}
+      dut.clockDomain.waitRisingEdge()
+      fork {read(dut, 40)}
+
+      val rspMonitor = fork {
+        for(i <- 0 until 40){
+          dut.clockDomain.waitSamplingWhere(
+           dut.io.r.rsp.valid.toBoolean && dut.io.r.rsp.ready.toBoolean
+          )
+          assert(i==dut.io.r.rsp.payload.toBigInt)
+        }
+      }
+
+      dut.clockDomain.waitRisingEdge(10)
+      dut.io.r.rsp.ready #= false
+      dut.clockDomain.waitRisingEdge(20)
+      dut.io.r.rsp.ready #= true
+      rspMonitor.join()
+    }
+  }
+}
+
+class CacheDataPackerTest extends AnyFunSuite {
+
+  class CacheDataPackerAxi4Wrapper extends Component {
+    val inst = new CacheDataPacker
+    val io = new Bundle {
+      val preSpike = slave(Stream(ReadySpike()))
+      val cache = master(Axi4(cacheAxi4Config))
+      val output = master(Stream(Fragment(new SynapseData)))
+    }
+    io.preSpike >> inst.io.input
+    io.output << inst.io.output
+    io.cache <> inst.io.cache.toAxi4()
+  }
+
+  val complied = SimConfig.withWave.compile(new CacheDataPackerAxi4Wrapper)
+  val axiMemConfig = AxiMemorySimConfig(
+    maxOutstandingReads = 1,
+    readResponseDelay = 5
+  )
+
+  test("cache fetch test"){
+    complied.doSim(959817836){dut =>
+      dut.clockDomain.forkStimulus(2)
+      SimTimeout(100000)
+      val cache = AxiMemorySim(dut.io.cache, dut.clockDomain, axiMemConfig)
+
+      dut.io.output.ready #= true
+      for(i <- 1 to 10){
+        dut.io.preSpike.valid #= true
+        dut.io.preSpike.nid #= i
+        dut.io.preSpike.cacheAddressBase #= i*100
+        dut.io.preSpike.len #= 99
+        dut.io.preSpike.threadAddressBase #= 0
+        dut.io.preSpike.dense #= true
+        dut.clockDomain.waitSamplingWhere(
+          dut.io.preSpike.ready.toBoolean
+        )
       }
     }
   }
 }
 
-class CacheBanksTest extends AnyFunSuite {
+class SynapseEventPackerTest extends AnyFunSuite {
+  val compiled = SimConfig.withWave.compile(new SynapseEventPacker)
 
-  class AxiCacheBanks extends Component {
-    val inst = new CacheBanks(64)
-    val c = inst.getAxi4Config
-    val axiR = inst.io.read.map(r => slave(r.toAxi4ReadOnlySlave(c, inst.UramLatency)))
-    val axiW = inst.io.write.map(w => slave(w.toAxi4WriteOnly(c)))
-  }
-
-  val offsetWidth = 8+3 // offset word width + axi word width
-  val burstLen = 255
-
-  test("no conflict write-read"){
-    SimConfig.withWave.compile(new AxiCacheBanks).doSim{dut=>
+  test("a test"){
+    compiled.doSim{dut=>
       dut.clockDomain.forkStimulus(2)
-      SimTimeout(100000)
-      for(axi <- dut.axiW){
-        axi.aw.valid #= false
-        axi.aw.burst #= 1
-        axi.aw.size #= 3
-        axi.w.valid #= false
-        axi.b.ready #= true
+      dut.io.output.ready #= true
+      val bmbMem = new BmbMemoryAgent(8 KiB)
+      bmbMem.addPort(dut.io.preSpikeTableBus, 0, dut.clockDomain, true, false)
+      bmbMem.addPort(dut.io.postSpikeTableBus, 0, dut.clockDomain, true, false)
+      for(addr <- 0 until (8 KiB).toInt){
+        bmbMem.setByte(addr, addr.toByte)
       }
-      for(axi <- dut.axiR){
-        axi.ar.valid #= false
-        axi.ar.burst #= 1
-        axi.ar.size #= 3
-        axi.r.ready #= true
-      }
-
-      (0 to 1).map{ portId =>
-        fork{
-          for(i <- portId to 21 by 2){
-            val wp = dut.axiW(portId)
-            wp.writeCmd.addr #= i << offsetWidth
-            wp.writeCmd.valid #= true
-            wp.writeCmd.len #= burstLen
-            wp.writeData.strb #= 0xFF
-            wp.writeData.valid #= true
-            for(j <- 0 to burstLen){
-              wp.writeData.data #= (i<<offsetWidth) + j
-              dut.clockDomain.waitSamplingWhere(
-                wp.writeData.ready.toBoolean
-              )
-            }
-            wp.writeCmd.valid #= false
-            wp.writeData.valid #= false
-          }
+      val (driver, inputQueue) = StreamDriver.queue(dut.io.input, dut.clockDomain)
+      driver.transactionDelay = () => 0
+      for(i <- 0 until 20){
+        inputQueue.enqueue{cmd =>
+          cmd.last #= Random.nextInt(10)==1
+          cmd.nid #= 100
+          cmd.postNidBase #= i<<3
         }
       }
-      // check is axi b raise at the same time to confirm no conflict
-      for(_ <- 0 to 21 by 2){
-        dut.clockDomain.waitRisingEdgeWhere(
-          dut.axiW(0).b.valid.toBoolean
-        )
-        assert(dut.axiW(1).b.valid.toBoolean)
-      }
-
-      // read test
-      (0 to 1).map{ portId =>
-        fork {
-          for (i <- portId to 21 by 2) {
-            val rp = dut.axiR(portId)
-            rp.readCmd.addr #= i << offsetWidth
-            rp.readCmd.valid #= true
-            rp.readCmd.len #= burstLen
-            dut.clockDomain.waitSamplingWhere(
-              rp.readCmd.ready.toBoolean
-            )
-            rp.readCmd.valid #= false
-
-            for(j <- 0 to burstLen){
-              dut.clockDomain.waitRisingEdgeWhere(
-                rp.readRsp.valid.toBoolean
-              )
-              assert(rp.readRsp.data.toBigInt == (i<<offsetWidth) + j)
-              assert(rp.readRsp.last.toBoolean == (j==burstLen))
-            }
-          }
-        }
-      }.foreach(_.join())
+      dut.clockDomain.waitRisingEdge(50)
     }
   }
 }

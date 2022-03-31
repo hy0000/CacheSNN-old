@@ -6,13 +6,10 @@ import spinal.lib._
 import cachesnn.AerBus._
 import cachesnn.Synapse._
 import cachesnn.Stdp._
-import spinal.lib.bus.bmb
-import spinal.lib.bus.bmb.BmbParameter.BurstAlignement.WORD
 import spinal.lib.bus.bmb._
-import spinal.lib.bus.regif.BusInterface
+
 
 object Stdp {
-  val busDataWidth = 32
   val spikeBufferSize = 4 KiB
   val stdpFpuMemSize = 4 KiB
   val neuronByteCount = 2
@@ -32,7 +29,7 @@ class SpikeQueryEvent(isPost:Boolean) extends Bundle {
   val neuronId = UInt(neuronIdWidth bits)
   val virtualSpike = ifGen(!isPost)(Bool())
   val offset = ifGen(isPost)(UInt(neuronIdWidth bits))
-  val weight = ifGen(isPost)(Bits(weightWidth bits))
+  val weight = ifGen(isPost)(Bits(16 bits))
 }
 
 case class SpikesRsp(isPost:Boolean) extends SpikeQueryEvent(isPost) with Spikes
@@ -40,7 +37,7 @@ case class SpikesRsp(isPost:Boolean) extends SpikeQueryEvent(isPost) with Spikes
 class SpikesTable(p: BmbParameter, size:BigInt, isPost:Boolean) extends Component {
   val io = new Bundle {
     val queryCmd = slave Stream new SpikeQueryEvent(isPost)
-    val queryRsp = master Stream new SpikesRsp(isPost)
+    val queryRsp = master Stream SpikesRsp(isPost)
     val bus = slave(Bmb(p))
   }
 
@@ -57,7 +54,7 @@ class SpikesTable(p: BmbParameter, size:BigInt, isPost:Boolean) extends Componen
     val context = Bits(p.access.contextWidth bits)
     // below are axon fields
     val offset = ifGen(isPost)(UInt(neuronIdWidth bits))
-    val weight = ifGen(isPost)(Bits(weightWidth bits))
+    val weight = ifGen(isPost)(Bits(16 bits))
 
     def neuronId:UInt = address @@ neuronIdLow
     def isEffectiveContext:Bool = 0=/=extractSrcContext(context)
@@ -194,42 +191,45 @@ case class StdpEvent() extends SpikeQueryEvent(true){
   def postNeuronId:UInt = neuronId
 }
 
+object StdpEventGen {
+  def delay = 2
+}
+
 class StdpEventGen extends Component {
+
   val io = new Bundle {
-    val preSpikes = slave Stream SpikesRsp(isPost = false)
-    val postSpikes = slave Stream SpikesRsp(isPost = true)
-    val stdpEvent = master Stream StdpEvent()
+    val event = slave(Event)
+    val preSpikes = in Bits(stdpTimeWindowWidth bits)
+    val virtual = in Bool()
+    val postSpikes = in Bits(stdpTimeWindowWidth bits)
+    val synapseEvent = master(Stream(new SynapseEvent))
   }
 
-  case class OhSpikes() extends SpikeQueryEvent(true){
+  case class OhSpikes() extends Bundle {
     val ohPrePreSpikes = Bits(stdpTimeWindowWidth bits)
     val ohLtpPostSpikes = Bits(stdpTimeWindowWidth bits)
     val ohLtdPostSpikes = Bits(stdpTimeWindowWidth bits)
-    override val virtualSpike = Bool()
-    val preNeuronId = UInt(neuronIdWidth bits)
+    val virtual = Bool()
   }
 
-  val ohSpikes = StreamJoin(io.preSpikes, io.postSpikes).translateWith{
+  val ohSpikes = io.event.translateWith{
     val ret = OhSpikes()
-    ret.assignSomeByName(io.postSpikes.payload)
-    val ohPrePreSpikes = OHMasking.first(io.preSpikes.spikes.dropLow(1)) ## B"0"
+    val ohPrePreSpikes = OHMasking.first(io.preSpikes.dropLow(1)) ## B"0"
     val ppsMask = (ohPrePreSpikes.asUInt-1).asBits | ohPrePreSpikes
-    val postSpikeMasked = io.postSpikes.spikes & ppsMask
+    val postSpikeMasked = io.postSpikes & ppsMask
     ret.ohPrePreSpikes := ohPrePreSpikes
     ret.ohLtpPostSpikes := OHMasking.roundRobin(
       postSpikeMasked.reversed, (ohPrePreSpikes<<1).reversed
     ).reversed
     ret.ohLtdPostSpikes := OHMasking.first(postSpikeMasked)
-    ret.virtualSpike := io.preSpikes.virtualSpike
-    ret.preNeuronId := io.preSpikes.neuronId
+    ret.virtual := io.virtual
     ret
   }.stage()
 
-  io.stdpEvent <-< ohSpikes.translateWith {
-    val ret = StdpEvent()
-    ret.assignSomeByName(ohSpikes.payload)
+  io.synapseEvent << ohSpikes.translateWith{
+    val ret = new SynapseEvent
     val prePreSpikeTime = OHToUInt(ohSpikes.ohPrePreSpikes)
-    ret.isLtd := ohSpikes.ohLtdPostSpikes.orR && (!ohSpikes.virtualSpike)
+    ret.isLtd := ohSpikes.ohLtdPostSpikes.orR && (!ohSpikes.virtual)
     ret.isLtp := ohSpikes.ohLtpPostSpikes.orR
     when(ret.isLtp){
       ret.ltpDeltaT := prePreSpikeTime - OHToUInt(ohSpikes.ohLtpPostSpikes)
@@ -245,7 +245,70 @@ class StdpEventGen extends Component {
   }
 }
 
+class SynapseEventPacker(readDelay:Int=4) extends Component {
+  val io = new Bundle {
+    val input = slave(Stream(Fragment(new SynapseData)))
+    val preSpikeTableBus = master(Bmb(spikeTableBmbParameter))
+    val postSpikeTableBus = master(Bmb(spikeTableBmbParameter))
+    val output = master(Stream(new SynapseEventPacket()))
+  }
+
+  val (toPreSpikeRead, toPostSpikeRead, toPipe) = StreamFork3(io.input)
+
+  io.preSpikeTableBus.cmd << toPreSpikeRead
+    .takeWhen(toPreSpikeRead.isFirst)
+    .translateWith{
+      val ret = cloneOf(io.preSpikeTableBus.cmd.fragment)
+      ret.address := ((toPreSpikeRead.nid @@ U"00") + BmbAddress.preSpikeTable.base).resized
+      ret.opcode := Bmb.Cmd.Opcode.READ
+      when(toPreSpikeRead.virtual){
+        ret.context := SpikeActionBmbContext.WR
+      }otherwise{
+        ret.context :=SpikeActionBmbContext.INSERT
+      }
+      ret.assignUnassignedByName(ret.getZero)
+      ret
+    }.addFragmentLast(True)
+
+  io.postSpikeTableBus.cmd << toPostSpikeRead.translateWith{
+    val ret = cloneOf(io.postSpikeTableBus.cmd.fragment)
+    ret.address := (toPostSpikeRead.postNidBase @@ U"00" + BmbAddress.postSpikeTable.base).resized
+    ret.opcode := Bmb.Cmd.Opcode.READ
+    ret.context := SpikeActionBmbContext.WR
+    ret.assignUnassignedByName(ret.getZero)
+    ret
+  }.addFragmentLast(True)
+
+  val synapseData = toPipe.queue(readDelay)
+
+  val preSpikes = RegNextWhen(
+    io.preSpikeTableBus.rsp.data.subdivideIn(stdpTimeWindowWidth bits)(synapseData.nid.takeLow(2).asUInt),
+    io.preSpikeTableBus.rsp.freeRun().valid
+  )
+  val postSpikesRaw:Stream[Vec[Bits]] = io.postSpikeTableBus.rsp.translateWith{
+    io.postSpikeTableBus.rsp.data.subdivideIn(stdpTimeWindowWidth bits)
+  }
+  val event = Event
+  event.arbitrationFrom(StreamJoin(postSpikesRaw, synapseData))
+  val eventFork = StreamFork(event, 4)
+
+  val synapseEvents = (0 until 4).map{ i =>
+    val ret = new StdpEventGen
+    ret.io.event.arbitrationFrom(eventFork(i))
+    ret.io.virtual := synapseData.virtual
+    ret.io.preSpikes := preSpikes
+    ret.io.postSpikes := postSpikesRaw.payload(i)
+    ret.io.synapseEvent
+  }
+
+  val synapseDataDelay = Delay(synapseData.fragment, StdpEventGen.delay, synapseData.fire)
+
+  io.output.arbitrationFrom(StreamJoin(synapseEvents))
+  io.output.payload.assignSomeByName(synapseDataDelay)
+  io.output.events := Vec(synapseEvents.map(_.payload))
+}
+
 object StdpVerilog extends App {
   //SpinalVerilog(new SpikesTable(bmbParameter, 4 KiB, false))
-  SpinalVerilog(new StdpEventGen)
+  //SpinalVerilog(new BmbAtomicRam(Synapse.postParamBmbParameter, Synapse.postParamSize/Synapse.nPostParamRam))
 }

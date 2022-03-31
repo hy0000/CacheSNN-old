@@ -2,45 +2,32 @@ package cachesnn
 
 import spinal.core._
 import spinal.lib._
-import cachesnn.Synapse._
 import cachesnn.Cache._
-import spinal.core.internals.PhaseMemBlackboxing
+import cachesnn.Synapse._
 import spinal.lib.bus.amba4.axi._
-import spinal.lib.bus.misc.{BusSlaveFactoryRead, SizeMapping}
+import spinal.lib.bus.bmb.Bmb
 
 object Cache {
-  val dataByte = 4
-  val memDataByte = dataByte*channels
-  val innerCacheAxiSlow = Axi4Config(
-    addressWidth = log2Up(cacheSize),
-    dataWidth = 32,
-    idWidth = 1,
-    useRegion = false,
-    useCache = false,
-    useProt = false,
-    useQos = false
-  )
-  val innerCacheAxiFast = innerCacheAxiSlow.copy(
-    dataWidth = 32*channels
-  )
-}
-/*
-case class CacheOut() extends Bundle {
-  val preNeuronId = UInt(neuronIdWidth bits)
-  val stdpParam = ???
-  val ltpOnly = Bool()
-}
-*/
-class Cache(nParallel: Int) extends Component {
-  val io = new Bundle {
-    //val dataBus = ???
-    //val spike = slave Stream new AerBus
-    //val ltpEvent = slave Stream UInt(neuronIdWidth bits)
-    //val cacheOut = master Stream CacheOut()
-  }
-  stub()
+  val tagTimeStampWidth = 4
+  val cacheLineSize = 1 KiB
+  val wayCount = 32
+  val wayCountPerStep = 8
+  val tagStep = wayCount/wayCountPerStep
+  val cacheLines = (nCacheBank*cacheBankSize/cacheLineSize).toInt
+  val setIndexRange = log2Up(cacheLines/wayCount)-1 downto 0
+  val setSize = wayCount * 2 Byte
 }
 
+object TagState extends SpinalEnum {
+  val HIT, AVAILABLE, BYPASS, REPLACE = newElement()
+  // bigger UInt encoding has higher priority
+  defaultEncoding = SpinalEnumEncoding("staticEncoding")(
+    HIT       -> 3,
+    AVAILABLE -> 2,
+    REPLACE   -> 1,
+    BYPASS    -> 0
+  )
+}
 case class MemWritePort[T <: Data](dataType : T, addressWidth:Int) extends Bundle {
   val address = UInt(addressWidth bits)
   val data = cloneOf(dataType)
@@ -67,6 +54,16 @@ case class MemWritePortStream[T <: Data](dataType : T, addressWidth:Int) extends
     ret.writeRsp.valid := cmdJoin.fire && cmdJoin._1.last
     ret.writeRsp.id := cmdJoin._1.id
     ret
+  }
+}
+
+case class MemReadPortFlow[T <: Data](dataType: T, addressWidth: Int) extends Bundle with IMasterSlave {
+  val cmd = Flow(UInt(addressWidth bit))
+  val rsp = Flow(dataType)
+
+  override def asMaster(): Unit = {
+    master(cmd)
+    slave(rsp)
   }
 }
 
@@ -109,7 +106,7 @@ class XilinxUram(wordWidth: Int, wordCount: BigInt) extends BlackBox {
   val io = new Bundle {
     val clk = in Bool()
     val reset = in Bool()
-    val r = slave(MemReadPortStream(dataType, addressWidth))
+    val r = slave(MemReadPortFlow(dataType, addressWidth))
     val w = slave(Flow(MemWritePort(dataType, addressWidth)))
   }
   noIoPrefix()
@@ -134,186 +131,211 @@ case class UramBank[T <: Data](dataType:T, wordCount: BigInt){
 
   def writePort = uram.io.w
 
-  def streamReadSync[T2 <: Data](cmd: Stream[UInt], linkedData: T2, nPipe: Int = 3): Stream[ReadRetLinked[T, T2]] = {
-    uram.io.r.cmd << cmd
-    val ret = Stream(ReadRetLinked(dataType, linkedData))
+  def streamReadSync[T2 <: Data](cmd: Stream[UInt], linkedData: T2, nPipe: Int = 2): Stream[ReadRetLinked[T, T2]] = {
+    uram.io.r.cmd << cmd.toFlowFire
+    val ret = Flow(ReadRetLinked(dataType, linkedData))
     val retLinked = RegNextWhen(linkedData, cmd.ready)
-    ret.arbitrationFrom(uram.io.r.rsp)
+    ret.valid := uram.io.r.rsp.valid
     ret.value := uram.io.r.rsp.payload.asInstanceOf[T]
     ret.linked := retLinked
 
-    Seq.fill(nPipe)(null)
-      .foldLeft(ret){(rsp, _) => rsp.stage() }
+    val piped = (0 until nPipe).foldLeft(ret)((rsp,_)=>rsp.stage()).toStream.queueLowLatency(nPipe+1) // 1 ram delay
+    cmd.ready := piped.ready
+    piped
   }
 }
 
-class CacheBanks(wordWidth: Int, lineSize: BigInt = 2 KiB, nBanks: Int = 8) extends Component {
-  def dataType = Bits(wordWidth bits)
-  def UramSize: BigInt = 32 KiB
-  def CacheSize: BigInt = UramSize * nBanks
-  def addressWidth = log2Up(CacheSize * 8 / wordWidth)
-  def lineWordCount = lineSize * 8 / wordWidth
-  def bankWordCount = UramSize * 8 / wordWidth
-  def bankAddressWidth = log2Up(bankWordCount)
-  def UramLatency = 4 // Uram has 1 fixed latency and nPipe = 3 latency
-  def toBankAddress(address:UInt):UInt ={
-    // bank address mapping (using word address)
-    // aer     : |-   line id h  -|- line id l -|-    offset    -|
-    // address : |- inner bank h -|- bank sel  -|- inner bank l -|
-
-    val lowWidth = log2Up(lineWordCount)
-    val heightWidth = address.getWidth - lowWidth - log2Up(nBanks)
-    (address.takeHigh(heightWidth) ## address.takeLow(lowWidth)).asUInt
-  }
-  def getAxi4Config:Axi4Config = {
-    Axi4Config(
-      addressWidth = log2Up(CacheSize),
-      dataWidth = wordWidth,
-      idWidth = 2,
-      useRegion = false,
-      useCache = false,
-      useProt = false,
-      useQos = false,
-      useResp = false,
-      useLock = false
-    )
-  }
-
-  val nRead, nWrite = 2
+case class Axi4UramBank(dataWidth:Int, byteCount:BigInt, idWidth:Int) extends Component {
+  val axi4Config = Axi4SharedOnChipRam.getAxiConfig(dataWidth, byteCount, idWidth)
 
   val io = new Bundle {
-    val read = Vec(slave(MemReadPortStream(dataType, addressWidth)), nRead)
-    val write = Vec(slave(MemWritePortStream(dataType, addressWidth)), nWrite)
+    val axi = slave(Axi4(axi4Config))
   }
+  val wordCount = byteCount / axi4Config.bytePerWord
+  val ram = UramBank(axi4Config.dataType, wordCount)
 
-  val banks = Seq.fill(nBanks)(
-    UramBank(dataType, bankWordCount)
-  )
+  val write = new Area{
+    val aw = io.axi.aw.unburstify
+    val wStage = StreamJoin(aw, io.axi.writeData)
 
-  case class readWithId() extends Bundle {
-    val address = UInt(bankAddressWidth bits)
-    val readPortId = UInt(log2Up(nRead) bits)
-  }
-
-  val allRead = io.read.zipWithIndex.flatMap{case (r, id) =>
-    val bankSel = r.cmd.payload(offset = log2Up(lineWordCount), log2Up(nBanks) bits)
-    val cmd = r.cmd.translateWith{
-      val ret = readWithId()
-      ret.address := toBankAddress(r.cmd.payload)
-      ret.readPortId := id
+    val writCmd = wStage.translateWith{
+      val ret = MemWritePort(axi4Config.dataType, axi4Config.wordRange.size)
+      ret.address := wStage._1.addr(axi4Config.wordRange)
+      ret.data := wStage._2.data
+      ret.mask := wStage._2.strb
       ret
     }
-    StreamDemux(cmd, bankSel, nBanks)
+
+    ram.writePort << writCmd.asFlow
+    io.axi.writeRsp.arbitrationFrom(writCmd)
+    io.axi.writeRsp.setOKAY()
+    io.axi.writeRsp.id := wStage._1.id
   }
 
-  val allWrite = io.write.flatMap{w =>
-    val bankSel = w.cmd.address(offset = log2Up(lineWordCount), log2Up(nBanks) bits)
-    val writeCmd = w.cmd.translateWith{
-      val ret = MemWritePort(dataType, bankAddressWidth)
-      ret.assignSomeByName(w.cmd.payload)
-      ret.address.removeAssignments()
-      ret.address := toBankAddress(w.cmd.address)
-      ret
-    }
-    StreamDemux(writeCmd, bankSel, nBanks)
-  }
-
-  // connect write cmd
-  for((b,id) <- banks.zipWithIndex){
-    val thisWrites = (id until allWrite.length by nBanks).map(allWrite(_))
-    b.writePort << StreamArbiterFactory.on(thisWrites).toFlow
-  }
-
-  val allRsp = banks.zipWithIndex.flatMap{case(b, id) =>
-    val thisReads  = (id until allRead.length by nBanks).map(allRead(_))
-    val thisRead = StreamArbiterFactory.on(thisReads)
-    val readCmd = thisRead.translateWith(thisRead.address)
-    val readRspLinked = b.streamReadSync(readCmd, thisRead.readPortId)
-    val readRsp = readRspLinked.translateWith(readRspLinked.value)
-    StreamDemux(readRsp, readRspLinked.linked, nRead)
-  }
-
-  // connect read rsp
-  for((r, id) <- io.read.zipWithIndex){
-    val thisRsps = (id until allRsp.length by nRead).map(allRsp(_))
-    r.rsp << StreamArbiterFactory.on(thisRsps)
+  val read = new Area{
+    val ar = io.axi.ar.unburstify
+    val cmd:Stream[UInt] = ar.translateWith(ar.addr(axi4Config.wordRange))
+    val rsp = ram.streamReadSync(cmd, ar.payload)
+    io.axi.readRsp.arbitrationFrom(rsp)
+    io.axi.readRsp.id := rsp.linked.id
+    io.axi.readRsp.last := rsp.linked.last
+    io.axi.readRsp.setOKAY()
+    io.axi.readRsp.data := rsp.value
   }
 }
-/*
-class CacheBanks extends Component{
 
+case class Tag() extends Bundle {
+  val valid = Bool()
+  val nid = UInt(nidWidth bits)
+  val timeStamp = UInt(tagTimeStampWidth bits)
+}
+
+class SpikeTagFilter extends Component {
   val io = new Bundle {
-    val slowBus = slave(Axi4(innerCacheAxiSlow))
-    val fastRead = slave(Axi4ReadOnly(innerCacheAxiFast))
-    val fastWrite = slave(Axi4WriteOnly(innerCacheAxiFast))
+    val metaSpike = slave(Stream(MetaSpikeT()))
+    val refractory = in UInt(tagTimeStampWidth bits)
+    val tagRam = master(Bmb(tagRamBmbParameter))
+    val missSpike = master(Stream(new MissSpike))
+    val readySpike = master(Stream(new ReadySpike))
   }
 
-  val banks = Seq.fill(nBank)(new Area{
-    val ram = Mem(Bits(memDataByte*8 bits), bankWordCount)
-      .generateAsBlackBox()
-    val axiConfig = innerCacheAxiFast.copy(
-      addressWidth = log2Up(cacheSize/nBank),
-      idWidth = 2
-    )
-    val axi = Axi4(axiConfig)
-
-    val aw = axi.aw.unburstify
-    val ar = axi.ar.unburstify
-
-    val wStage0 = aw.haltWhen(aw.valid && !axi.writeData.valid)
-    ram.write(
-      address = wStage0.addr(axiConfig.wordRange),
-      data = axi.writeData.data,
-      enable = wStage0.fire,
-      mask = axi.writeData.strb
-    )
-    axi.writeData.ready := wStage0.ready
-
-    val wStage1 = wStage0.stage()
-    wStage1.ready := axi.writeRsp.ready || !wStage1.last
-
-    axi.writeRsp.valid := wStage1.valid && wStage1.last
-    axi.writeRsp.id := wStage1.id
-    axi.writeRsp.setOKAY()
-
-    val rStage = ar.stage()
-    rStage.ready := axi.readRsp.ready
-
-    axi.readRsp.data := ram.readSync(
-      address = ar.addr(axiConfig.wordRange),
-      enable = ar.fire
-    )
-    axi.readRsp.valid  := rStage.valid
-    axi.readRsp.id  := rStage.id
-    axi.readRsp.last := rStage.last
-    axi.readRsp.setOKAY()
-  })
-
-
-  val fastBus = {
-    val upSizer = Axi4Upsizer(innerCacheAxiSlow, innerCacheAxiFast, 4)
-    upSizer.io.input << io.slowBus
-    upSizer.io.output
+  case class WaySelFolder() extends Bundle{
+    val way = UInt(log2Up(wayCount) bits)
+    val state = TagState()
+    def priority = state.asBits.asUInt
   }
 
-  val cc = Axi4CrossbarFactory()
-  val addressSizePerBank = bankWordCount*memDataByte
-  val addressMapping = (0 until nBank).map{id=>
-    println(s"${(id*addressSizePerBank).hexString()} ${addressSizePerBank.hexString()}")
-    SizeMapping(id*addressSizePerBank, addressSizePerBank)
+  val read = new Area {
+    io.tagRam.cmd.arbitrationFrom(io.metaSpike)
+    io.tagRam.cmd.address := (io.metaSpike.nid(setIndexRange) << log2Up(setSize)).resized
+    io.tagRam.cmd.opcode := Bmb.Cmd.Opcode.READ
+    io.tagRam.cmd.length := tagStep-1
+    io.tagRam.cmd.last := True
+    io.tagRam.cmd.fragment.assignUnassignedByName(io.tagRam.cmd.fragment.getZero)
   }
-  val bankAxis = banks.map(_.axi)
-  for((axi, address) <- bankAxis.zip(addressMapping)){
-    cc.addSlaves((axi, address))
+
+  val spike = RegNextWhen(io.metaSpike.payload, io.metaSpike.ready)
+  val stepCnt = Counter(tagStep, io.tagRam.rsp.fire)
+  val tags = io.tagRam.rsp.data
+    .subdivideIn(16 bits)
+    .map{b=>
+      val ret = Tag()
+      ret.assignFromBits(b)
+      ret
+    }
+
+  val hitsOh = tags.map(tag => tag.valid && tag.nid===spike.nid)
+  val hit = Cat(hitsOh).orR
+  val hitWay = OHToUInt(hitsOh)
+
+  val availableOh = tags.map(!_.valid)
+  val available = Cat(availableOh).orR
+  val availableWay = OHToUInt(availableOh)
+
+  val replacesOh = tags.map(tag => tag.valid && (spike.tagTimeStamp-tag.timeStamp)>io.refractory)
+  val replace = Cat(replacesOh).orR
+  val replaceWay = OHToUInt(replacesOh)
+
+  val currentWaySel = WaySelFolder()
+  val waySelFolder = Reg(WaySelFolder())
+  when(hit){
+    currentWaySel.way := stepCnt @@ hitWay
+    currentWaySel.state := TagState.HIT
+  }elsewhen available {
+    currentWaySel.way := stepCnt @@ availableWay
+    currentWaySel.state := TagState.AVAILABLE
+  }elsewhen replace {
+    currentWaySel.way := stepCnt @@ replaceWay
+    currentWaySel.state := TagState.REPLACE
+  }otherwise {
+    currentWaySel.way := 0
+    currentWaySel.state := TagState.BYPASS
   }
-  cc.addConnections(
-    (fastBus, bankAxis),
-    (io.fastWrite, bankAxis),
-    (io.fastRead, bankAxis)
-  )
-  cc.build()
-}*/
+
+  when(io.tagRam.rsp.isFirst || currentWaySel.priority > waySelFolder.priority){
+    waySelFolder := currentWaySel
+  }
+
+  val spikeDelay = io.tagRam.rsp.translateWith{
+    val ret = new MetaSpike
+    ret.assignSomeByName(spike)
+    ret
+  }.takeWhen(io.tagRam.rsp.last)
+
+  val (missSpike, hitSpike) = StreamFork2(spikeDelay)
+  val cacheAddressBase = (spikeDelay.nid(setIndexRange) @@ waySelFolder.way) << log2Up(cacheLineSize)
+  io.missSpike << missSpike
+    .takeWhen(waySelFolder.state=/=TagState.HIT)
+    .translateWith{
+      val ret = new MissSpike
+      ret.assignSomeByName(spikeDelay.payload)
+      ret.cacheAddressBase := cacheAddressBase
+      ret.writeBack := waySelFolder.state===TagState.REPLACE
+      ret
+    }
+  io.readySpike << hitSpike
+    .takeWhen(waySelFolder.state===TagState.HIT)
+    .translateWith{
+      val ret = ReadySpike()
+      ret.assignSomeByName(spikeDelay.payload)
+      ret.cacheAddressBase := cacheAddressBase
+      ret
+    }
+}
+
+class CacheDataPacker extends Component {
+  val io = new Bundle {
+    val input = slave(Stream(ReadySpike()))
+    val cache = master(Axi4ReadOnly(cacheAxi4Config))
+    val output = master(Stream(Fragment(new SynapseData)))
+  }
+
+  // dispatch pet-spike to cache read port by address low to avoid read conflict
+  val spikeDispatch = new Area {
+    val sel = cacheAddressToBankSel(io.input.cacheAddressBase)
+    val scatterSpikes = StreamDemux(io.input, sel, nCacheBank).map(_.stage())
+    val noConflictSpike = StreamArbiterFactory.roundRobin.on(scatterSpikes)
+  }
+
+  val (spikeToAxi, spikeToBuffer) = StreamFork2(spikeDispatch.noConflictSpike)
+  val spikeBuffer = spikeToBuffer.queue(2)
+
+  val readCmdSend = new Area {
+    io.cache.readCmd.arbitrationFrom(spikeToAxi)
+    io.cache.readCmd.size := Axi4.size.BYTE_64.asUInt
+    io.cache.readCmd.burst := Axi4.burst.INCR
+    io.cache.readCmd.addr := spikeToAxi.cacheAddressBase
+    io.cache.readCmd.len := spikeToAxi.len.resized
+  }
+
+  val readRspRec = new Area {
+    val readRsp = io.cache.readRsp
+    val axiLastReady = readRsp.ready && readRsp.last
+
+    val recWordCount = Counter(cacheLenWidth bits, readRsp.fire && spikeBuffer.dense)
+    when(axiLastReady) { recWordCount.clear() }
+
+    spikeBuffer.ready := axiLastReady
+
+    io.output << readRsp.translateWith{
+      val ret = new SynapseData
+      ret.assignSomeByName(spikeBuffer.payload)
+      ret.data := readRsp.data
+      ret.offset := recWordCount
+      when(spikeBuffer.dense){
+        ret.weightValid := readRsp.last ? spikeBuffer.lastWordMask | B"1111"
+        ret.postNidBase := spikeBuffer.threadAddressBase + (recWordCount @@ U"00")
+      }otherwise{
+        // weightValid 4 b | postNid 12 b | 16 b * 3 data |
+        ret.weightValid := readRsp.data.takeHigh(4)
+        ret.postNidBase := spikeBuffer.threadAddressBase + readRsp.data(16*3, nidWidth bits).asUInt
+      }
+      ret
+    }.addFragmentLast(readRsp.last)
+  }
+}
 
 object CacheVerilog extends App {
-  SpinalVerilog(new CacheBanks(64, 2048))
+  //SpinalVerilog(Axi4UramBank(64, 32 KiB, 2))
+  SpinalVerilog(new SpikeTagFilter)
 }

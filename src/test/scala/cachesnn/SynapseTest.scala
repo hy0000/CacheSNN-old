@@ -3,7 +3,7 @@ package cachesnn
 import org.scalatest.funsuite.AnyFunSuite
 import spinal.core.sim._
 import spinal.lib.bus.bmb.sim._
-
+/*
 class SynapseTest extends AnyFunSuite{
   val compiled = SimConfig
     .withWave
@@ -41,3 +41,4 @@ class SynapseTest extends AnyFunSuite{
     }
   }
 }
+*/

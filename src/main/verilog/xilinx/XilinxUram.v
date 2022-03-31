@@ -17,18 +17,14 @@ module XilinxUram #(
     // stream read cmd
     input              r_cmd_valid,
     input [AWIDTH-1:0] r_cmd_address,
-    output             r_cmd_ready,
 
     // stream read rsp
     output reg              r_rsp_valid,
-    output reg [DWIDTH-1:0] r_rsp_data,
-    input                   r_rsp_ready
+    output reg [DWIDTH-1:0] r_rsp_data
    );
 
 (* ram_style = "ultra" *)
 reg [DWIDTH-1:0] mem[(1<<AWIDTH)-1:0];        // Memory Declaration
-
-wire r_cmd_fire = r_cmd_ready && r_cmd_valid;
 
 integer          i;
 localparam CWIDTH = DWIDTH/NUM_COL;
@@ -40,7 +36,7 @@ always @ (posedge clk) begin
 	        if(w_mask[i])
                 mem[w_address][i*CWIDTH +: CWIDTH] <= w_data[i*CWIDTH +: CWIDTH];
 
-    if(r_cmd_fire)
+    if(r_cmd_valid)
         r_rsp_data <= mem[r_cmd_address];
 end
 
@@ -48,12 +44,9 @@ always @(posedge clk or posedge reset) begin
     if(reset) begin
         r_rsp_valid <= 1'b0;
     end else begin
-        if(r_cmd_ready)
-            r_rsp_valid <= r_cmd_valid;
+        r_rsp_valid <= r_cmd_valid;
     end
 end
-
-assign r_cmd_ready = r_rsp_ready;
 endmodule                                     
 					
 			
