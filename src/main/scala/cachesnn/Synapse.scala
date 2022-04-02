@@ -1,7 +1,7 @@
 package cachesnn
 
 import cachesnn.AerBus.stdpTimeWindowWidth
-import cachesnn.Cache.tagTimeStampWidth
+import cachesnn.Cache.{tagRamAddressWidth, tagTimeStampWidth}
 import spinal.core._
 import spinal.lib._
 import cachesnn.Synapse._
@@ -39,9 +39,8 @@ object Synapse {
   val postParamWordSize = 16 Byte // 8 parameter maybe enough
   val postParamSize = postParamWordSize*neuronSize
   val nPostParamRam = 4
-  val victimLines = 16
   val cacheAxi4Config = Axi4Config(
-    addressWidth = 18, // 17 for 128 KB cache, 1 for rest
+    addressWidth = 18, // 17 for 128 KB cache, 1 for bypass
     dataWidth = busDataWidth,
     useId = false,
     useRegion = false,
@@ -120,7 +119,8 @@ object Synapse {
 class Spike extends Bundle {
   val nid = UInt(nidWidth bits)
   val virtual = Bool()
-  //val thread = UInt(log2Up(threads) bits)
+  val ssn = UInt(nidWidth + 1 bits) // spike sequence number, the worst cast has max spike and max virtual spike
+  val thread = UInt(log2Up(threads) bits)
 }
 
 class MetaSpike extends Spike {
@@ -136,7 +136,9 @@ case class MetaSpikeT() extends MetaSpike {
 
 class MissSpike extends MetaSpike {
   val cacheAddressBase = cacheAxi4Config.addressType
-  val writeBack = Bool()
+  val tagState = TagState()
+  def tagAddress = ???
+  def tagMask = ???
 }
 
 case class ReadySpike() extends MetaSpike {
@@ -164,6 +166,10 @@ class SynapseEventPacket extends SynapseData {
 
 case class SynapsePacket() extends SynapseEventPacket {
   val postParam = Bits(postParamBmbParameter.access.dataWidth bits)
+}
+
+case class AckSpike() extends Spike {
+  val tagAddress = Bits(tagRamAddressWidth bits)
 }
 
 class Synapse extends Component {
