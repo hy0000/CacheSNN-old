@@ -1,7 +1,7 @@
 package cachesnn
 
 import cachesnn.AerBus.stdpTimeWindowWidth
-import cachesnn.Cache.{tagRamAddressWidth, tagTimeStampWidth}
+import cachesnn.Cache.{ssnWidth, tagRamAddressWidth, tagTimeStampWidth}
 import spinal.core._
 import spinal.lib._
 import cachesnn.Synapse._
@@ -100,12 +100,13 @@ object Synapse {
   }
 
   object GlobalAddress{
-    val cache = (0 until nCacheBank).map(i => SizeMapping(i*cacheBankSize, cacheBankSize))
-    val bmbSpace = SizeMapping(cache.last.end + 1, BmbAddress.size)
+    val cacheBanks = (0 until nCacheBank).map(i => SizeMapping(i*cacheBankSize, cacheBankSize))
+    val bmbSpace = SizeMapping(cacheBanks.last.end + 1, BmbAddress.size)
+    val cache = SizeMapping(0, cacheBankSize*nCacheBank)
 
     def printAddressMapping(): Unit ={
       import BmbAddress._
-      println(f"cache:          ${cache.head.base.hexString(20)}-${cache.last.end.hexString(20)}  ${nCacheBank*cacheBankSize/1024}%3d KB")
+      println(f"cache:          ${cache.base.hexString(20)}-${cache.end.hexString(20)}  ${nCacheBank*cacheBankSize/1024}%3d KB")
       println(f"preSpikeTable:  ${(bmbSpace.base+preSpikeTable.base).hexString(20)}-${(bmbSpace.base+preSpikeTable.end).hexString(20)}  ${spikeTableSize/1024}%3d KB")
       println(f"postSpikeTable: ${(bmbSpace.base+postSpikeTable.base).hexString(20)}-${(bmbSpace.base+postSpikeTable.end).hexString(20)}  ${spikeTableSize/1024}%3d KB")
       println(f"postParam:      ${(bmbSpace.base+postParam.base).hexString(20)}-${(bmbSpace.base+postParam.end).hexString(20)}  ${postParamSize/1024}%3d KB")
@@ -119,7 +120,7 @@ object Synapse {
 class Spike extends Bundle {
   val nid = UInt(nidWidth bits)
   val virtual = Bool()
-  val ssn = UInt(nidWidth + 1 bits) // spike sequence number, the worst cast has max spike and max virtual spike
+  val ssn = UInt(ssnWidth bits)
   val thread = UInt(log2Up(threads) bits)
 }
 
@@ -128,6 +129,13 @@ class MetaSpike extends Spike {
   val lastWordMask = Bits(busDataWidth/16 bits)
   val threadAddressBase = UInt(nidWidth bits)
   val dense = Bool()
+
+  def lastByteMask:Bits = {
+    B(lastWordMask.asBools
+      .zip(lastWordMask.asBools)
+      .map(m =>m._1 ## m._2)
+      .reduce(_##_))
+  }
 }
 
 case class MetaSpikeT() extends MetaSpike {
@@ -169,7 +177,8 @@ case class SynapsePacket() extends SynapseEventPacket {
 }
 
 case class AckSpike() extends Spike {
-  val tagAddress = Bits(tagRamAddressWidth bits)
+  val tagAddress = UInt(tagRamAddressWidth bits)
+  val tagWayMask = Bits(Cache.wayCountPerStep bits)
 }
 
 class Synapse extends Component {
@@ -206,7 +215,7 @@ class Synapse extends Component {
     //postParamRam.size.load(BmbAddress.postParam.size)
 
 
-    for((bank, addrMap) <- cacheBanks.zip(GlobalAddress.cache)){
+    for((bank, addrMap) <- cacheBanks.zip(GlobalAddress.cacheBanks)){
       axiCrossBar.addSlave(bank.io.axi, addrMap)
     }
     axiCrossBar.addConnection((dataPacker.cacheBus, cacheBanks.map(_.io.axi)))
