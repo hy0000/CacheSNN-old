@@ -1,16 +1,15 @@
 package cachesnn
 
-import cachesnn.Synapse.{cacheAxi4Config, spikeTableBmbParameter}
+import cachesnn.Synapse.{cacheAxi4Config, cacheLenWidth, neuronSize, nidWidth}
+import cachesnn.Cache._
 import org.scalatest.funsuite.AnyFunSuite
 import spinal.core._
 import spinal.lib._
 import spinal.core.sim._
 import spinal.lib.bus.amba4.axi._
 import spinal.lib.bus.amba4.axi.sim._
-import spinal.lib.bus.bmb.Bmb
 import spinal.lib.bus.bmb.sim.BmbMemoryAgent
-import spinal.lib.bus.misc.SizeMapping
-import spinal.lib.sim.{StreamDriver, StreamReadyRandomizer}
+import spinal.lib.sim._
 
 import scala.util.Random
 object CacheTest {
@@ -165,5 +164,142 @@ class SynapseEventPackerTest extends AnyFunSuite {
       }
       dut.clockDomain.waitRisingEdge(50)
     }
+  }
+}
+
+case class TagSim(valid:Boolean = false,
+                  lock:Boolean = false,
+                  nid:Int = 0,
+                  thread:Int = 0,
+                  timeStamp:Int = 0)
+
+case class TagRamSim(bus:TagRamBus, clockDomain: ClockDomain) {
+  private val size = tagStep*(1<<setIndexRange.size)
+  val ram = Array.tabulate(size,wayCountPerStep)((_,_) =>TagSim())
+
+  val (rspDriver, rspQueue) = StreamDriver.queue(bus.readRsp, clockDomain)
+  rspDriver.transactionDelay = () => 1
+  StreamReadyRandomizer(bus.readCmd, clockDomain)
+  StreamReadyRandomizer(bus.writeCmd, clockDomain)
+  StreamMonitor(bus.readCmd, clockDomain){ addr=>
+    val rsp = ram(addr.toInt)
+    rspQueue.enqueue{tags=>
+      tags.zip(rsp).foreach{case(tag, tagSim)=>
+        tag.nid #= tagSim.nid
+        tag.valid #= tagSim.valid
+        tag.thread #= tagSim.thread
+        tag.lock #= tagSim.lock
+        tag.timeStamp #= tagSim.timeStamp
+      }
+    }
+  }
+  StreamMonitor(bus.writeCmd, clockDomain){ cmd=>
+    val tagSims = ram(cmd.address.toInt)
+    for((tagSim, way) <- tagSims.zipWithIndex){
+      val wayValid = ((cmd.wayMask.toInt>>way)&0x1)==1
+      if(wayValid){
+        ram(cmd.address.toInt)(way) = TagSim(
+          nid = cmd.tags(way).nid.toInt,
+          valid = cmd.tags(way).valid.toBoolean,
+          thread = cmd.tags(way).thread.toInt,
+          lock = cmd.tags(way).lock.toBoolean,
+          timeStamp= cmd.tags(way).timeStamp.toInt
+        )
+      }
+    }
+  }
+
+  def updateAll(op: TagSim => TagSim):Unit = {
+    for(i <- 0 until size){
+      for(j <- 0 until wayCountPerStep){
+        op(ram(i)(j))
+      }
+    }
+  }
+
+  def flush(): Unit ={
+    updateAll(_=>TagSim())
+  }
+
+  def setValid(): Unit = {
+    updateAll(_.copy(valid = true))
+  }
+  def setLock():Unit = {
+    updateAll(_.copy(lock = true))
+  }
+  def clearLock(): Unit ={
+    updateAll(_.copy(lock = false))
+  }
+  def wayOccupancy = {
+    ram.map(
+      _.map(_.valid.toInt).sum
+    ).grouped(tagStep).map(_.sum).toArray
+  }
+}
+
+case class SpikeDriver[T<:Spike](port:Stream[T], clockDomain: ClockDomain){
+  private val (driver, spikeQueue) = StreamDriver.queue(port, clockDomain)
+  driver.transactionDelay = ()=>0
+  private var timeStamp = 0
+
+  def setTimeStamp(t:Int): Unit ={
+    timeStamp = t
+  }
+
+  def send(nid:Int): Unit ={
+    spikeQueue.enqueue { spike =>
+      spike.nid #= nid
+      spike match {
+        case metaSpikeT: MetaSpikeT => metaSpikeT.tagTimeStamp #= timeStamp
+        //case metaSpike:MetaSpike =>
+      }
+    }
+  }
+}
+
+class SpikeTagFilterTest extends AnyFunSuite {
+  val compiled = SimConfig.withWave.compile(new SpikeTagFilter)
+
+  test("hit all"){
+    compiled.doSim(1807999387){ dut =>
+      dut.clockDomain.forkStimulus(2)
+      SimTimeout(10000)
+      val tagRam = TagRamSim(dut.io.tagRamBus, dut.clockDomain)
+      dut.io.missSpike.ready #= true
+      dut.io.refractory #= 1
+      dut.io.readySpike.ready #= true
+
+      val spikeDriver = SpikeDriver(dut.io.metaSpike, dut.clockDomain)
+      val nidBase = 0//Random.nextInt(neuronSize-cacheLines)
+      val nidEnd = nidBase+11
+      for(nid <- nidBase until nidEnd){
+        spikeDriver.send(nid)
+      }
+      // first time all spike are compulsory conflict
+      for(nid <- nidBase until nidEnd){
+        dut.clockDomain.waitSamplingWhere(dut.io.missSpike.valid.toBoolean)
+        assert(dut.io.missSpike.nid.toInt==nid)
+        assert(dut.io.missSpike.tagState.toEnum==TagState.AVAILABLE)
+      }
+      // all tags should be occupied
+      for((occupancy, way) <- tagRam.wayOccupancy.zipWithIndex){
+        assert(occupancy==wayCount, s"way: $way occupancy:${tagRam.wayOccupancy.mkString(" ")}")
+      }
+      tagRam.clearLock()
+      for(nid <- nidBase until nidEnd){
+        spikeDriver.send(nid)
+      }
+      // after set valid, all spike should hit
+      for(nid <- nidBase until nidEnd){
+        dut.clockDomain.waitSamplingWhere(dut.io.readySpike.valid.toBoolean)
+        assert(dut.io.readySpike.nid.toInt==nid)
+      }
+    }
+  }
+  test("lock all"){
+
+  }
+  test("replace all"){
+
   }
 }
