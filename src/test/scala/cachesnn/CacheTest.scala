@@ -178,9 +178,10 @@ case class TagRamSim(bus:TagRamBus, clockDomain: ClockDomain) {
   val ram = Array.tabulate(size,wayCountPerStep)((_,_) =>TagSim())
 
   val (rspDriver, rspQueue) = StreamDriver.queue(bus.readRsp, clockDomain)
-  rspDriver.transactionDelay = () => 1
   StreamReadyRandomizer(bus.readCmd, clockDomain)
   StreamReadyRandomizer(bus.writeCmd, clockDomain)
+  //bus.readCmd.ready #= true
+  //bus.writeCmd.ready #= true
   StreamMonitor(bus.readCmd, clockDomain){ addr=>
     val rsp = ram(addr.toInt)
     rspQueue.enqueue{tags=>
@@ -212,7 +213,7 @@ case class TagRamSim(bus:TagRamBus, clockDomain: ClockDomain) {
   def updateAll(op: TagSim => TagSim):Unit = {
     for(i <- 0 until size){
       for(j <- 0 until wayCountPerStep){
-        op(ram(i)(j))
+        ram(i)(j) = op(ram(i)(j))
       }
     }
   }
@@ -220,7 +221,21 @@ case class TagRamSim(bus:TagRamBus, clockDomain: ClockDomain) {
   def flush(): Unit ={
     updateAll(_=>TagSim())
   }
-
+  def fillSpike(nidSeq:Seq[Int]): Unit ={
+    val setIdMask = (1<<setIndexRange.size)-1
+    val setIdOffset = log2Up(tagStep)
+    val wayIdOffset = log2Up(wayCountPerStep)
+    val wayMask = (1<<wayIdOffset)-1
+    val wayOccupancy = Array.fill(cacheLines/wayCount)(0)
+    for(nid <- nidSeq){
+      val setId = nid & setIdMask
+      val way = wayOccupancy(setId)
+      val wayId = way & wayMask
+      val address = (setId<<setIdOffset) | (way>>wayIdOffset)
+      ram(address)(wayId) = TagSim(nid = nid, valid = true)
+      wayOccupancy(setId) += 1
+    }
+  }
   def setValid(): Unit = {
     updateAll(_.copy(valid = true))
   }
@@ -255,51 +270,193 @@ case class SpikeDriver[T<:Spike](port:Stream[T], clockDomain: ClockDomain){
       }
     }
   }
+  def send(nidSeq:Seq[Int]): Unit ={
+    for(nid <- nidSeq){
+      send(nid)
+    }
+  }
 }
 
 class SpikeTagFilterTest extends AnyFunSuite {
   val compiled = SimConfig.withWave.compile(new SpikeTagFilter)
+  val compiledWithInnerFifo = SimConfig.compile{
+    val ret = new SpikeTagFilter
+    ret.spikeRollBackFifo.io.simPublic()
+    ret
+  }
 
-  test("hit all"){
-    compiled.doSim(1807999387){ dut =>
+  case class TagRamDrivers(dut:SpikeTagFilter){
+    val tagRam = TagRamSim(dut.io.tagRamBus, dut.clockDomain)
+    val spikeDriver = SpikeDriver(dut.io.metaSpike, dut.clockDomain)
+    StreamReadyRandomizer(dut.io.missSpike, dut.clockDomain)
+    StreamReadyRandomizer(dut.io.readySpike, dut.clockDomain)
+    dut.io.refractory #= 1
+    private val nidBase = Random.nextInt(neuronSize-cacheLines)
+    val spikes = nidBase until nidBase+cacheLines
+
+    def assertHit(nid:Int): Unit ={
+      dut.clockDomain.waitSamplingWhere(
+        dut.io.readySpike.valid.toBoolean && dut.io.readySpike.ready.toBoolean
+      )
+      assert(dut.io.readySpike.nid.toInt==nid)
+    }
+    def assertHit(spikes:Seq[Int]): Unit ={
+      for(nid <- spikes){
+        assertHit(nid)
+      }
+    }
+    def assertMiss(nid:Int, tagState:TagState.E): Unit ={
+      dut.clockDomain.waitSamplingWhere(
+        dut.io.missSpike.valid.toBoolean && dut.io.missSpike.ready.toBoolean
+      )
+      assert(dut.io.missSpike.nid.toInt==nid)
+      assert(dut.io.missSpike.tagState.toEnum == tagState)
+    }
+    def assertMiss(spikes:Seq[Int], tagState:TagState.E): Unit ={
+      for(nid <- spikes){
+        assertMiss(nid, tagState)
+      }
+    }
+    def assertReplace(spikes:Seq[Int]): Unit ={
+      assertMiss(spikes, TagState.REPLACE)
+    }
+    def assertAvailable(spikes:Seq[Int]): Unit ={
+      assertMiss(spikes, TagState.AVAILABLE)
+    }
+  }
+
+  test("all compulsory conflict") {
+    compiled.doSim { dut =>
       dut.clockDomain.forkStimulus(2)
-      SimTimeout(10000)
-      val tagRam = TagRamSim(dut.io.tagRamBus, dut.clockDomain)
-      dut.io.missSpike.ready #= true
-      dut.io.refractory #= 1
-      dut.io.readySpike.ready #= true
-
-      val spikeDriver = SpikeDriver(dut.io.metaSpike, dut.clockDomain)
-      val nidBase = 0//Random.nextInt(neuronSize-cacheLines)
-      val nidEnd = nidBase+11
-      for(nid <- nidBase until nidEnd){
-        spikeDriver.send(nid)
-      }
+      SimTimeout(100000)
+      val driver = TagRamDrivers(dut)
+      import driver.{tagRam, spikeDriver, spikes}
+      spikeDriver.send(spikes)
       // first time all spike are compulsory conflict
-      for(nid <- nidBase until nidEnd){
-        dut.clockDomain.waitSamplingWhere(dut.io.missSpike.valid.toBoolean)
-        assert(dut.io.missSpike.nid.toInt==nid)
-        assert(dut.io.missSpike.tagState.toEnum==TagState.AVAILABLE)
-      }
+      driver.assertAvailable(spikes)
       // all tags should be occupied
-      for((occupancy, way) <- tagRam.wayOccupancy.zipWithIndex){
-        assert(occupancy==wayCount, s"way: $way occupancy:${tagRam.wayOccupancy.mkString(" ")}")
-      }
-      tagRam.clearLock()
-      for(nid <- nidBase until nidEnd){
-        spikeDriver.send(nid)
-      }
-      // after set valid, all spike should hit
-      for(nid <- nidBase until nidEnd){
-        dut.clockDomain.waitSamplingWhere(dut.io.readySpike.valid.toBoolean)
-        assert(dut.io.readySpike.nid.toInt==nid)
+      for ((occupancy, way) <- tagRam.wayOccupancy.zipWithIndex) {
+        assert(occupancy == wayCount, s"way: $way occupancy:${tagRam.wayOccupancy.mkString(" ")}")
       }
     }
   }
-  test("lock all"){
 
+  test("hit all test"){
+    compiled.doSim { dut =>
+      dut.clockDomain.forkStimulus(2)// all tags are locked
+        SimTimeout(100000)
+        val driver = TagRamDrivers(dut)
+        import driver.{tagRam, spikeDriver, spikes}
+        tagRam.fillSpike(spikes)
+        spikeDriver.send(spikes)
+        driver.assertHit(spikes)
+    }
   }
-  test("replace all"){
+  test("replace test"){
+    compiled.doSim { dut =>
+      dut.clockDomain.forkStimulus(2)// all tags are locked
+      SimTimeout(100000)
+      val driver = TagRamDrivers(dut)
+      import driver.{tagRam, spikeDriver, spikes}
+      tagRam.fillSpike(spikes)
+      // force replace half under timeStamp equal
+      val replaceSpikes = spikes.take(spikes.length/2).map(nid => (nid+cacheLines)%neuronSize)
+      val noReplaceSpikes = spikes.drop(spikes.length/2)
+      spikeDriver.setTimeStamp(0)
+      spikeDriver.send(replaceSpikes)
+      driver.assertReplace(replaceSpikes)
 
+      // test replaced spikes
+      tagRam.clearLock()
+      spikeDriver.setTimeStamp(1)
+      spikeDriver.send(replaceSpikes)
+      driver.assertHit(replaceSpikes)
+
+      // test no replaced spikes
+      tagRam.clearLock()
+      spikeDriver.setTimeStamp(2)
+      spikeDriver.send(noReplaceSpikes)
+      driver.assertHit(noReplaceSpikes)
+
+      // now the replace spikes with timestamp 1
+      // the no replace spikes with timestamp 2
+      // follow re replace spikes will take place replace spikes, default refractory is 1
+      tagRam.clearLock()
+      spikeDriver.setTimeStamp(3)
+      val reReplaceSpikes = spikes.take(spikes.length/2)
+      spikeDriver.send(reReplaceSpikes)
+      driver.assertReplace(reReplaceSpikes)
+    }
+  }
+
+  test("lock test"){
+    compiledWithInnerFifo.doSim { dut =>
+      dut.clockDomain.forkStimulus(2)
+      SimTimeout(100000)
+      val driver = TagRamDrivers(dut)
+      import driver.{tagRam, spikeDriver, spikes}
+      tagRam.fillSpike(spikes)
+      tagRam.setLock()
+      spikeDriver.send(spikes)
+      dut.clockDomain.waitSamplingWhere(
+        !dut.spikeRollBackFifo.io.push.ready.toBoolean
+      )
+      tagRam.clearLock()
+      // rsp nid is out of order
+      for(_ <- spikes){
+        dut.clockDomain.waitSamplingWhere(
+          dut.io.readySpike.valid.toBoolean && dut.io.readySpike.ready.toBoolean
+        )
+      }
+    }
+  }
+  test("fail test"){
+    compiledWithInnerFifo.doSim { dut =>
+      dut.clockDomain.forkStimulus(2)
+      SimTimeout(100000)
+      val driver = TagRamDrivers(dut)
+      import driver.{tagRam, spikeDriver, spikes}
+      tagRam.fillSpike(spikes)
+      tagRam.setLock()
+      val failSpikes = spikes.map(nid => (nid+cacheLines)%neuronSize)
+      spikeDriver.send(failSpikes)
+      dut.clockDomain.waitSamplingWhere(
+        !dut.spikeRollBackFifo.io.push.ready.toBoolean
+      )
+      tagRam.clearLock()
+      // rsp nid is out of order
+      for(_ <- spikes){
+        dut.clockDomain.waitSamplingWhere(
+          dut.io.missSpike.valid.toBoolean && dut.io.missSpike.ready.toBoolean
+        )
+        assert(dut.io.missSpike.tagState.toEnum==TagState.REPLACE)
+      }
+    }
+  }
+  test("cache address test"){
+    compiled.doSim { dut =>
+      dut.clockDomain.forkStimulus(2)// all tags are locked
+      SimTimeout(100000)
+      val driver = TagRamDrivers(dut)
+      import driver.{tagRam, spikeDriver}
+
+      // sequential spikes are allocated with sequential cache address
+      val sequentialSpikes = (0 until cacheLines)
+      val setOffset = log2Up(wayCount)
+      val cacheLineOffset = log2Up(cacheLineSize)
+      val addressSeq = Seq.tabulate(wayCount, 1<<setIndexRange.size){(way,set)=>
+        (set<<setOffset | way)<<cacheLineOffset
+      }.flatten
+
+      tagRam.fillSpike(sequentialSpikes)
+      spikeDriver.send(sequentialSpikes)
+      for((nid, address) <- sequentialSpikes.zip(addressSeq)){
+        driver.assertHit(nid)
+        assert(
+          dut.io.readySpike.cacheAddressBase.toInt==address,
+          s"${dut.io.readySpike.cacheAddressBase.toInt.hexString()} ${address.hexString()}"
+        )
+      }
+    }
   }
 }

@@ -14,7 +14,7 @@ object Cache {
   val tagTimeStampWidth = 3
   val cacheLineSize = 1 KiB
   val cacheLines = (nCacheBank*cacheBankSize/cacheLineSize).toInt
-  val wayCount = 32
+  val wayCount = 16
   val wayCountPerStep = 8
   val setIndexRange = log2Up(cacheLines/wayCount)-1 downto 0
   val setSize = wayCount * 2 Byte
@@ -28,7 +28,7 @@ object Cache {
 
 object TagState extends SpinalEnum {
   val HIT = newElement("hit")
-  val LOCKED = newElement("local")
+  val LOCKED = newElement("locked")
   val AVAILABLE = newElement("available")
   val REPLACE = newElement("replace")
   val FAIL = newElement("fail")
@@ -234,46 +234,24 @@ class SpikeTagFilter extends Component {
   }
   val spikeRollBackFifo = StreamFifo(MetaSpikeT(), oooLengthMax-wayCount)
 
-  val spikeBuffer = StreamArbiterFactory.roundRobin
+  val metaSpike = StreamArbiterFactory.roundRobin
     .on(Seq(io.metaSpike, spikeRollBackFifo.io.pop))
-    .stage()
+  val spikeBuffer = Reg(metaSpike.payload)
+  val stepCmd = Counter(tagStep, io.tagRamBus.readCmd.fire)
+  val stepRsp= Counter(tagStep, io.tagRamBus.readRsp.fire)
+  val rspEvent = Event
 
-  val step = Counter(tagStep, io.tagRamBus.readCmd.fire)
-  val stepDelay = RegNextWhen(step.value, io.tagRamBus.readCmd.fire)
-  val stepOver = Bool()
-  when(stepOver){
-    step.clear()
-  }
+  io.tagRamBus.readCmd.valid := False
+  io.tagRamBus.readCmd.payload := spikeBuffer.nid(setIndexRange) @@ stepCmd
+  io.tagRamBus.readRsp.ready := True
+  metaSpike.ready := False
+  rspEvent.valid := False
 
-  //val fsm = new StateMachine {
-  //  val idle = new State with EntryPoint
-  //  val folding = new State
-  //  val end = new State
-  //
-  //  idle
-  //    .whenIsActive{
-  //      when(spikeBuffer.valid)( goto(folding) )
-  //    }
-  //  folding
-  //    .whenIsActive{
-  //      when(stepOver)( goto(end) )
-  //    }
-  //  end
-  //    .whenIsActive{
-  //      when(spikeBuffer.valid)( goto(folding) )
-  //        .otherwise( goto(idle) )
-  //    }
-  //}
-
-  val read = new Area {
-    io.tagRamBus.readCmd.valid := spikeBuffer.valid && io.tagRamBus.readRsp.isFree
-    io.tagRamBus.readCmd.payload := spikeBuffer.nid(setIndexRange) @@ step
-  }
-
-  val tags = io.tagRamBus.readRsp.payload
 
   val tagDetect = new Area{
-    val hitsOh = tags.map(tag => tag.valid && tag.nid===spikeBuffer.nid)
+    val tags = io.tagRamBus.readRsp.payload
+
+    val hitsOh = tags.map(tag => tag.valid && tag.nid===spikeBuffer.nid && !tag.lock)
     val hit = Cat(hitsOh).orR
     val hitWay = OHToUInt(OHMasking.first(hitsOh))
 
@@ -295,19 +273,19 @@ class SpikeTagFilter extends Component {
 
     val currentWaySel = WaySelFolder()
     when(hit){
-      currentWaySel.way := stepDelay @@ hitWay
+      currentWaySel.way := stepRsp @@ hitWay
       currentWaySel.state := HIT
     }elsewhen locked {
-      currentWaySel.way := stepDelay @@ lockedWay
+      currentWaySel.way := stepRsp @@ lockedWay
       currentWaySel.state := LOCKED
     }elsewhen available {
-      currentWaySel.way := stepDelay @@ availableWay
+      currentWaySel.way := stepRsp @@ availableWay
       currentWaySel.state := AVAILABLE
     }elsewhen replace {
-      currentWaySel.way := stepDelay @@ replaceWay
+      currentWaySel.way := stepRsp @@ replaceWay
       currentWaySel.state := REPLACE
     }elsewhen noneLock {
-      currentWaySel.way := stepDelay @@ replaceWayAuxiliary
+      currentWaySel.way := stepRsp @@ replaceWayAuxiliary
       currentWaySel.state := REPLACE
     }otherwise{
       currentWaySel.way := 0
@@ -315,66 +293,105 @@ class SpikeTagFilter extends Component {
     }
 
     val waySelFolder = Reg(WaySelFolder())
-    val selCurrentWay = stepDelay===U(0) || currentWaySel.priority > waySelFolder.priority
-    when(io.tagRamBus.readRsp.valid && selCurrentWay){
+    val selCurrent = stepRsp===U(0) || currentWaySel.priority > waySelFolder.priority
+    when(io.tagRamBus.readRsp.fire && selCurrent){
       waySelFolder := currentWaySel
     }
+  }
 
+  val fsm = new StateMachine {
+    val idle = new State with EntryPoint
+    val foldCmd = new State
+    val foldRsp = new State
+    val foldLast = new State
+    val rsp = new State
 
-    stepOver := hit || locked || stepDelay===U(tagStep-1)
-    val result = io.tagRamBus.readRsp
-      .takeWhen(stepOver)
-      .stage()
-      .translateWith(waySelFolder)
+    idle
+      .whenIsActive{
+        when(metaSpike.valid)( goto(foldCmd) )
+      }
+    foldCmd
+      .onEntry{
+        metaSpike.ready := True
+        spikeBuffer := metaSpike.payload
+      }
+      .whenIsActive{
+        when(stepCmd.willOverflow){
+          goto(foldRsp)
+        }
+        io.tagRamBus.readCmd.valid := True
+      }
+    foldRsp
+      .whenIsActive{
+        when(stepRsp.willOverflow){
+          goto(foldLast)
+        }
+      }
+    foldLast
+      .whenIsActive{
+        goto(rsp)
+      }
+    rsp
+      .whenIsActive{
+        when(rspEvent.ready){
+          when(metaSpike.valid)( goto(foldCmd) )
+            .otherwise( goto(idle) )
+        }
+        rspEvent.valid := True
+      }
   }
 
   val (toTagUpdateSpike, toReadySpike, toMissSpike, toRollBackSpike) = {
-    import tagDetect.result
-    val ret = StreamFork(StreamJoin(result, spikeBuffer), 4, synchronous = true)
+    import tagDetect.waySelFolder
+    val ret = StreamFork(rspEvent, 4, synchronous = true)
     (
-      ret(0).throwWhen(result.isRollBackState),
-      ret(1).takeWhen(result.state===TagState.HIT),
-      ret(2).takeWhen(result.isMissState),
-      ret(3).takeWhen(result.isRollBackState)
+      ret(0).throwWhen(waySelFolder.isRollBackState),
+      ret(1).takeWhen(waySelFolder.state===TagState.HIT),
+      ret(2).takeWhen(waySelFolder.isMissState),
+      ret(3).takeWhen(waySelFolder.isRollBackState)
     )
   }
 
-  val cacheAddressBase = (spikeBuffer.nid(setIndexRange) @@ tagDetect.result.way) << log2Up(cacheLineSize)
+  val outputAssign = new Area{
+    import tagDetect.waySelFolder
+    val cacheAddressBase = (spikeBuffer.nid(setIndexRange) @@ waySelFolder.way) << log2Up(cacheLineSize)
 
-  io.missSpike << toMissSpike.translateWith{
-    val ret = new MissSpike
-    ret.assignSomeByName(spikeBuffer.payload)
-    ret.cacheAddressBase := cacheAddressBase
-    ret.tagState := tagDetect.result.state
-    ret
+    io.missSpike << toMissSpike.translateWith{
+      val ret = new MissSpike
+      ret.assignSomeByName(spikeBuffer)
+      ret.cacheAddressBase := cacheAddressBase
+      ret.tagState := waySelFolder.state
+      ret
+    }
+
+    io.readySpike << toReadySpike.translateWith{
+      val ret = ReadySpike()
+      ret.assignSomeByName(spikeBuffer)
+      ret.cacheAddressBase := cacheAddressBase
+      ret
+    }
+
+    io.tagRamBus.writeCmd << toTagUpdateSpike.translateWith{
+      val newTag = Tag()
+      newTag.lock := True
+      newTag.valid := True
+      newTag.nid := spikeBuffer.nid
+      newTag.thread := spikeBuffer.thread
+      newTag.timeStamp := spikeBuffer.tagTimeStamp
+      val ret = cloneOf(io.tagRamBus.writeCmd)
+      ret.setAddress(waySelFolder.way, spikeBuffer.nid(setIndexRange))
+      ret.setMask(waySelFolder.way)
+      ret.tags := Vec(Seq.fill(wayCountPerStep)(newTag))
+      ret
+    }
+
+    spikeRollBackFifo.io.push << toRollBackSpike.translateWith{
+      val ret = MetaSpikeT()
+      ret.assignAllByName(spikeBuffer)
+      ret
+    }
   }
 
-  io.readySpike << toReadySpike.translateWith{
-    val ret = ReadySpike()
-    ret.assignSomeByName(spikeBuffer.payload)
-    ret.cacheAddressBase := cacheAddressBase
-    ret
-  }
-
-  io.tagRamBus.writeCmd << toTagUpdateSpike.translateWith{
-    val newTag = Tag()
-    newTag.lock := True
-    newTag.valid := True
-    newTag.nid := spikeBuffer.nid
-    newTag.thread := spikeBuffer.thread
-    newTag.timeStamp := spikeBuffer.tagTimeStamp
-    val ret = cloneOf(io.tagRamBus.writeCmd)
-    ret.setAddress(tagDetect.result.way, spikeBuffer.nid(setIndexRange))
-    ret.setMask(tagDetect.result.way)
-    ret.tags := Vec(Seq.fill(wayCountPerStep)(newTag))
-    ret
-  }
-
-  spikeRollBackFifo.io.push << toRollBackSpike.translateWith{
-    val ret = MetaSpikeT()
-    ret.assignAllByName(spikeBuffer.payload)
-    ret
-  }
 }
 
 trait SpikeCacheData extends Bundle {
@@ -769,5 +786,5 @@ class CacheDataPacker extends Component {
 
 object CacheVerilog extends App {
   //SpinalVerilog(Axi4UramBank(64, 32 KiB, 2))
-  SpinalVerilog(new CacheDataCtrl)
+  SpinalVerilog(new SpikeTagFilter)
 }
