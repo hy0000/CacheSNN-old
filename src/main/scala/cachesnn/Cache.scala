@@ -18,6 +18,7 @@ object Cache {
   val wayCountPerStep = 8
   val setIndexRange = log2Up(cacheLines/wayCount)-1 downto 0
   val setSize = wayCount * 2 Byte
+  val tagWidth = nidWidth - setIndexRange.size
   val tagStep = wayCount/wayCountPerStep
   val bypassBufferItems = 8
   val tagRamAddressWidth = setIndexRange.size + log2Up(tagStep)
@@ -144,7 +145,7 @@ case class UramBank[T <: Data](dataType:T, wordCount: BigInt){
 }
 
 case class Axi4UramBank(dataWidth:Int, byteCount:BigInt, idWidth:Int) extends Component {
-  val axi4Config = Axi4SharedOnChipRam.getAxiConfig(dataWidth, byteCount, idWidth)
+  var axi4Config = Axi4SharedOnChipRam.getAxiConfig(dataWidth, byteCount, idWidth)
 
   val io = new Bundle {
     val axi = slave(Axi4(axi4Config))
@@ -153,7 +154,7 @@ case class Axi4UramBank(dataWidth:Int, byteCount:BigInt, idWidth:Int) extends Co
   val ram = UramBank(axi4Config.dataType, wordCount)
 
   val write = new Area{
-    val aw = io.axi.aw.unburstify
+    val aw = io.axi.aw.s2mPipe().unburstify
     val wStage = StreamJoin(aw, io.axi.writeData)
 
     val writCmd = wStage.translateWith{
@@ -165,7 +166,7 @@ case class Axi4UramBank(dataWidth:Int, byteCount:BigInt, idWidth:Int) extends Co
     }
 
     ram.writePort << writCmd.asFlow
-    io.axi.writeRsp.arbitrationFrom(writCmd)
+    io.axi.writeRsp.arbitrationFrom(writCmd.takeWhen(io.axi.writeData.last))
     io.axi.writeRsp.setOKAY()
     io.axi.writeRsp.id := wStage._1.id
   }
@@ -185,7 +186,8 @@ case class Axi4UramBank(dataWidth:Int, byteCount:BigInt, idWidth:Int) extends Co
 case class Tag() extends Bundle {
   val valid = Bool()
   val lock = Bool()
-  val nid = UInt(nidWidth bits)
+  val dirty = Bool()
+  val tag = UInt(tagWidth bits)
   val thread = UInt(log2Up(threads) bits)
   val timeStamp = UInt(tagTimeStampWidth bits)
 }
@@ -228,6 +230,7 @@ class SpikeTagFilter extends Component {
   case class WaySelFolder() extends Bundle{
     val way = UInt(log2Up(wayCount) bits)
     val state = TagState()
+    val dirty = Bool()
     def priority = state.asBits.asUInt
     def isRollBackState:Bool = state===LOCKED || state===FAIL
     def isMissState:Bool = state===AVAILABLE || state===REPLACE
@@ -251,11 +254,11 @@ class SpikeTagFilter extends Component {
   val tagDetect = new Area{
     val tags = io.tagRamBus.readRsp.payload
 
-    val hitsOh = tags.map(tag => tag.valid && tag.nid===spikeBuffer.nid && !tag.lock)
+    val hitsOh = tags.map(tag => tag.valid && tag.tag===spikeBuffer.tag && !tag.lock)
     val hit = Cat(hitsOh).orR
     val hitWay = OHToUInt(OHMasking.first(hitsOh))
 
-    val lockedOh = tags.map(tag => tag.valid && tag.nid===spikeBuffer.nid && tag.lock)
+    val lockedOh = tags.map(tag => tag.valid && tag.tag===spikeBuffer.tag && tag.lock)
     val locked = Cat(lockedOh).orR
     val lockedWay = OHToUInt(OHMasking.first(lockedOh))
 
@@ -269,7 +272,7 @@ class SpikeTagFilter extends Component {
 
     val noneLockOh = tags.map(tag => tag.valid && !tag.lock)
     val noneLock = Cat(noneLockOh).orR
-    val replaceWayAuxiliary = OHToUInt(OHMasking.first(noneLockOh))
+    val auxiliaryReplaceWay = OHToUInt(OHMasking.first(noneLockOh))
 
     val currentWaySel = WaySelFolder()
     when(hit){
@@ -285,12 +288,14 @@ class SpikeTagFilter extends Component {
       currentWaySel.way := stepRsp @@ replaceWay
       currentWaySel.state := REPLACE
     }elsewhen noneLock {
-      currentWaySel.way := stepRsp @@ replaceWayAuxiliary
+      currentWaySel.way := stepRsp @@ auxiliaryReplaceWay
       currentWaySel.state := REPLACE
     }otherwise{
       currentWaySel.way := 0
       currentWaySel.state := FAIL
     }
+
+    currentWaySel.dirty := tags(currentWaySel.way.resized).dirty
 
     val waySelFolder = Reg(WaySelFolder())
     val selCurrent = stepRsp===U(0) || currentWaySel.priority > waySelFolder.priority
@@ -361,6 +366,7 @@ class SpikeTagFilter extends Component {
       ret.assignSomeByName(spikeBuffer)
       ret.cacheAddressBase := cacheAddressBase
       ret.tagState := waySelFolder.state
+      ret.cover := !waySelFolder.dirty
       ret
     }
 
@@ -375,7 +381,8 @@ class SpikeTagFilter extends Component {
       val newTag = Tag()
       newTag.lock := True
       newTag.valid := True
-      newTag.nid := spikeBuffer.nid
+      newTag.dirty := waySelFolder.dirty
+      newTag.tag := spikeBuffer.tag
       newTag.thread := spikeBuffer.thread
       newTag.timeStamp := spikeBuffer.tagTimeStamp
       val ret = cloneOf(io.tagRamBus.writeCmd)
@@ -402,26 +409,37 @@ case class MissSpikeWithData() extends MissSpike with SpikeCacheData
 case class MetaSpikeWithData() extends MetaSpike with SpikeCacheData
 
 class MissSpikeCtrl extends Component {
+  val axi4Config = cacheAxi4Config
+
   val io = new Bundle {
     val writeBackSpikeData = master(Stream(Fragment(MetaSpikeWithData())))
     val missSpikeData = slave(Stream(Fragment(MissSpikeWithData())))
     val readySpike = master(Stream(ReadySpike()))
-    val cache = master(Axi4(cacheAxi4Config))
+    val cache = master(Axi4(axi4Config))
+  }
+
+  when(io.missSpikeData.valid){
+    assert(
+      io.missSpikeData.cover || io.missSpikeData.tagState=/=TagState.AVAILABLE,
+      message = L"available tagState without cover is illegal, nid:${io.missSpikeData.nid}"
+    )
   }
 
   val spikeFork = new Area{
     private val missSpikeFork = StreamFork2(io.missSpikeData)
-    private val writeDataSrc  = StreamDemux(missSpikeFork._1, (missSpikeFork._1.tagState===TagState.REPLACE).asUInt, 2)
-    private val busHeaderSrc  = StreamFork2(missSpikeFork._2.takeWhen(missSpikeFork._2.isFirst))
+    private val dataFifo = missSpikeFork._1.queue(cacheReadDelay+2) // 1 for fifo, 1 for RAW counters update
+    private val writeDataSrc  = StreamDemux(dataFifo, dataFifo.cover.asUInt, 2)
+    private val busHeaderSrc  = StreamFork(missSpikeFork._2.takeWhen(missSpikeFork._2.isFirst), 4)
 
-    private val readHeaderSrc  = StreamFork2(busHeaderSrc._1.takeWhen(busHeaderSrc._1.tagState===TagState.REPLACE))
-    val writeHeader = busHeaderSrc._2
+    val spikeReadQueue = busHeaderSrc(0).throwWhen(busHeaderSrc(0).cover).queue(2)
+    val spikeWriteQueue = busHeaderSrc(1).queue(2)
+    val writeHeader = busHeaderSrc(2)
+    val readHeader = busHeaderSrc(3).throwWhen(busHeaderSrc(3).cover)
 
-    val readHeader = readHeaderSrc._1
-    val readHeaderDelay = readHeaderSrc._2.queue(2)
+    val coverWrite = writeDataSrc(1)
+    val replaceWrite = writeDataSrc(0)
 
-    val availableWrite = writeDataSrc(0).stage()
-    val replaceWrite = writeDataSrc(1).queue(cacheReadDelay+1)
+    spikeReadQueue.ready := io.cache.readRsp.fire && io.cache.readRsp.last
   }
 
   val axi = new Area {
@@ -432,12 +450,14 @@ class MissSpikeCtrl extends Component {
     io.cache.readCmd.size := Axi4.size.BYTE_8.asUInt
     io.cache.readCmd.burst := Axi4.burst.INCR
     io.cache.readCmd.len := readHeader.len.resized
+    if(axi4Config.useId) io.cache.readCmd.id := 0
 
     io.cache.writeCmd.arbitrationFrom(writeHeader)
     io.cache.writeCmd.addr := writeHeader.cacheAddressBase
     io.cache.writeCmd.size := Axi4.size.BYTE_8.asUInt
     io.cache.writeCmd.burst := Axi4.burst.INCR
     io.cache.writeCmd.len := writeHeader.len.resized
+    if(axi4Config.useId) io.cache.writeCmd.id := 0
 
     val readRspCounter, writeDataCounter= Counter(cacheLenMax)
     when(io.cache.readRsp.fire) {
@@ -459,8 +479,8 @@ class MissSpikeCtrl extends Component {
       readRspCounter===writeDataCounter
     )
 
-    val writeData = StreamArbiterFactory.on(
-      Seq(replaceWriteConsistency, availableWrite)
+    val writeData = StreamArbiterFactory.fragmentLock.on(
+      Seq(replaceWriteConsistency, coverWrite)
     )
     io.cache.writeData.arbitrationFrom(writeData)
     io.cache.writeData.data := writeData.data
@@ -472,16 +492,15 @@ class MissSpikeCtrl extends Component {
     val ret = cloneOf(io.writeBackSpikeData.payload)
     ret.last := io.cache.readRsp.last
     ret.data := io.cache.readRsp.data
-    ret.fragment.assignUnassignedByName(spikeFork.readHeaderDelay.fragment)
+    ret.fragment.assignUnassignedByName(spikeFork.spikeReadQueue.fragment)
     ret
   }
 
   val writeOver = new Area{
-    import spikeFork.readHeaderDelay
-
-    val event = StreamJoin(io.cache.writeRsp, readHeaderDelay)
+    import spikeFork.spikeWriteQueue
+    val event = StreamJoin(io.cache.writeRsp, spikeWriteQueue)
     io.readySpike.arbitrationFrom(event)
-    io.readySpike.payload.assignAllByName(readHeaderDelay.fragment)
+    io.readySpike.payload.assignAllByName(spikeWriteQueue.fragment)
   }
 }
 

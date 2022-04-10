@@ -1,7 +1,7 @@
 package cachesnn
 
 import cachesnn.AerBus.stdpTimeWindowWidth
-import cachesnn.Cache.{ssnWidth, tagRamAddressWidth, tagTimeStampWidth}
+import cachesnn.Cache.{ssnWidth, tagRamAddressWidth, tagTimeStampWidth, tagWidth}
 import spinal.core._
 import spinal.lib._
 import cachesnn.Synapse._
@@ -42,12 +42,11 @@ object Synapse {
   val cacheAxi4Config = Axi4Config(
     addressWidth = 18, // 17 for 128 KB cache, 1 for bypass
     dataWidth = busDataWidth,
-    useId = false,
+    idWidth = 1,
     useRegion = false,
     useCache = false,
     useProt = false,
     useQos = false,
-    useResp = false,
     useLock = false
   )
   val tagRamBmbParameter = BmbParameter(
@@ -122,6 +121,8 @@ class Spike extends Bundle {
   val virtual = Bool()
   val ssn = UInt(ssnWidth bits)
   val thread = UInt(log2Up(threads) bits)
+
+  def tag:UInt = nid.takeHigh(tagWidth).asUInt
 }
 
 class MetaSpike extends Spike {
@@ -145,8 +146,7 @@ case class MetaSpikeT() extends MetaSpike {
 class MissSpike extends MetaSpike {
   val cacheAddressBase = cacheAxi4Config.addressType
   val tagState = TagState()
-  def tagAddress = ???
-  def tagMask = ???
+  val cover = Bool()
 }
 
 case class ReadySpike() extends MetaSpike {
@@ -179,6 +179,7 @@ case class SynapsePacket() extends SynapseEventPacket {
 case class AckSpike() extends Spike {
   val tagAddress = UInt(tagRamAddressWidth bits)
   val tagWayMask = Bits(Cache.wayCountPerStep bits)
+  val dirty = Bool()
 }
 
 class Synapse extends Component {
