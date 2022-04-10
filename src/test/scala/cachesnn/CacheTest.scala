@@ -337,6 +337,7 @@ case class SpikeSim(nid:Int,
       data = defaultSpike.data
     )
   }
+  def dataSeq:Seq[BigInt] = (0 to len).map(_ + (nid.toLong<<32).toBigInt)
 }
 object SpikeSim{
   def apply[S<:Spike](spike:S): SpikeSim ={
@@ -365,44 +366,42 @@ case class SpikeDriver[T<:Data](port:Stream[T], clockDomain: ClockDomain){
     timeStamp = t
   }
 
-  def send[S<:Spike](spikeSim:SpikeSim, last:Boolean = false): Unit ={
-    spikeQueue.enqueue { s =>
-      val spike = s match {
-        case sd: Fragment[S] =>{
-          sd.last #= last
-          sd.fragment
+  def send[S<:Spike](spikeSim:SpikeSim): Unit ={
+    for((data, i) <- spikeSim.dataSeq.zipWithIndex){
+      spikeQueue.enqueue { s =>
+        val spike = s match {
+          case sd: Fragment[S] =>{
+            sd.last #= i==spikeSim.len
+            sd.fragment
+          }
+          case _ => s
         }
-        case _ => s
-      }
 
-      spike match {
-        case ss:S =>
-          ss.nid #= spikeSim.nid
-          ss.thread #= spikeSim.thread
-          ss.ssn #= spikeSim.ssn
-          ss.virtual #= spikeSim.virtual
-      }
+        spike match {
+          case ss:S =>
+            ss.nid #= spikeSim.nid
+            ss.thread #= spikeSim.thread
+            ss.ssn #= spikeSim.ssn
+            ss.virtual #= spikeSim.virtual
+        }
 
-      spike match {
-        case metaSpikeT: MetaSpikeT => metaSpikeT.tagTimeStamp #= timeStamp
-        case ackSpike: AckSpike => ackSpike.dirty #= spikeSim.dirty
-        case missSpike:MissSpikeWithData =>
-          missSpike.len #= spikeSim.len
-          missSpike.cacheAddressBase #= spikeSim.cacheAddressBase
-          missSpike.tagState #= spikeSim.tagState
-          missSpike.cover #= spikeSim.cover
-          missSpike.data #= spikeSim.data
+        spike match {
+          case metaSpikeT: MetaSpikeT => metaSpikeT.tagTimeStamp #= timeStamp
+          case ackSpike: AckSpike => ackSpike.dirty #= spikeSim.dirty
+          case missSpike:MissSpikeWithData =>
+            missSpike.len #= spikeSim.len
+            missSpike.cacheAddressBase #= spikeSim.cacheAddressBase
+            missSpike.tagState #= spikeSim.tagState
+            missSpike.cover #= spikeSim.cover
+            missSpike.data #= data
+            missSpike.lastWordMask #= 0xF
+        }
       }
     }
   }
   def send(spikeSimSeq:Seq[SpikeSim]): Unit ={
     for(spikeSim <- spikeSimSeq){
-      for(n <- 0 to spikeSim.len){
-        send(
-          spikeSim.copy(data = n + (spikeSim.nid.toLong<<32)),
-          last = n==spikeSim.len
-        )
-      }
+      send(spikeSim)
     }
   }
 }
@@ -757,7 +756,6 @@ class MissSpikeCtrlTest extends AnyFunSuite {
       }
     }
   }
-
   test("consist cover write"){
     complied.doSim{ dut =>
       dut.clockDomain.forkStimulus(2)
@@ -773,7 +771,6 @@ class MissSpikeCtrlTest extends AnyFunSuite {
       driver.waitAllSpikesReady()
     }
   }
-
   test("consist replace"){
     complied.doSim{ dut =>
       dut.clockDomain.forkStimulus(2)
@@ -789,7 +786,6 @@ class MissSpikeCtrlTest extends AnyFunSuite {
       driver.waitAllSpikesReady()
     }
   }
-
   test("mix test"){
     complied.doSim{ dut =>
       dut.clockDomain.forkStimulus(2)
@@ -809,6 +805,28 @@ class MissSpikeCtrlTest extends AnyFunSuite {
       spikeDriver.send(spikes)
       readySpikeMonitorQueue ++= spikes.map(_.pruneToReadySpike)
       driver.waitAllSpikesReady()
+    }
+  }
+  test("RAW hazard test"){
+    complied.doSim{ dut =>
+      dut.clockDomain.forkStimulus(2)
+      SimTimeout(1000000)
+      val driver = MissSpikeCtrlDriver(dut)
+      import driver.{spikeDriver, readySpikeMonitorQueue}
+
+      val cacheAddress = (8 KiB).toInt
+      val initSpike = SpikeSim(0, len = 127, cacheAddressBase = cacheAddress, tagState = TagState.AVAILABLE, cover = true)
+      spikeDriver.send(initSpike)
+      val replaceSpike = initSpike.copy(tagState = TagState.REPLACE, cover = false)
+      spikeDriver.send(replaceSpike)
+      readySpikeMonitorQueue ++= Seq(initSpike.pruneToReadySpike, replaceSpike.pruneToReadySpike)
+      for(data <- initSpike.dataSeq){
+        dut.clockDomain.waitSamplingWhere(dut.io.writeBackSpikeData.valid.toBoolean)
+        assert(
+          dut.io.writeBackSpikeData.data.toBigInt==data,
+          f"${dut.io.writeBackSpikeData.data.toBigInt.hexString()}, ${data.hexString()}"
+        )
+      }
     }
   }
 }
