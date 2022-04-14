@@ -147,6 +147,7 @@ class MissSpike extends MetaSpike {
   val cacheAddressBase = cacheAxi4Config.addressType
   val tagState = TagState()
   val cover = Bool()
+  val replaceNid = UInt(nidWidth bits)
 }
 
 case class ReadySpike() extends MetaSpike {

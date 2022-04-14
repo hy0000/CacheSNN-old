@@ -172,7 +172,7 @@ case class Axi4UramBank(dataWidth:Int, byteCount:BigInt, idWidth:Int) extends Co
   }
 
   val read = new Area{
-    val ar = io.axi.ar.unburstify
+    val ar = io.axi.ar.s2mPipe().unburstify
     val cmd:Stream[UInt] = ar.translateWith(ar.addr(axi4Config.wordRange))
     val rsp = ram.streamReadSync(cmd, ar.payload)
     io.axi.readRsp.arbitrationFrom(rsp)
@@ -230,7 +230,7 @@ class SpikeTagFilter extends Component {
   case class WaySelFolder() extends Bundle{
     val way = UInt(log2Up(wayCount) bits)
     val state = TagState()
-    val dirty = Bool()
+    val tag = Tag()
     def priority = state.asBits.asUInt
     def isRollBackState:Bool = state===LOCKED || state===FAIL
     def isMissState:Bool = state===AVAILABLE || state===REPLACE
@@ -295,7 +295,7 @@ class SpikeTagFilter extends Component {
       currentWaySel.state := FAIL
     }
 
-    currentWaySel.dirty := tags(currentWaySel.way.resized).dirty
+    currentWaySel.tag := tags(currentWaySel.way.resized)
 
     val waySelFolder = Reg(WaySelFolder())
     val selCurrent = stepRsp===U(0) || currentWaySel.priority > waySelFolder.priority
@@ -366,7 +366,8 @@ class SpikeTagFilter extends Component {
       ret.assignSomeByName(spikeBuffer)
       ret.cacheAddressBase := cacheAddressBase
       ret.tagState := waySelFolder.state
-      ret.cover := !waySelFolder.dirty
+      ret.cover := !waySelFolder.tag.dirty
+      ret.replaceNid := waySelFolder.tag.tag @@ ret.nid(setIndexRange)
       ret
     }
 
@@ -381,7 +382,7 @@ class SpikeTagFilter extends Component {
       val newTag = Tag()
       newTag.lock := True
       newTag.valid := True
-      newTag.dirty := waySelFolder.dirty
+      newTag.dirty := waySelFolder.tag.dirty
       newTag.tag := spikeBuffer.tag
       newTag.thread := spikeBuffer.thread
       newTag.timeStamp := spikeBuffer.tagTimeStamp
@@ -405,8 +406,10 @@ trait SpikeCacheData extends Bundle {
   val data = Bits(busDataWidth bits)
 }
 
-case class MissSpikeWithData() extends MissSpike with SpikeCacheData
 case class MetaSpikeWithData() extends MetaSpike with SpikeCacheData
+case class MissSpikeWithData() extends MissSpike with SpikeCacheData{
+  val replaceSpike = new MetaSpike
+}
 
 class MissSpikeCtrl extends Component {
   val axi4Config = cacheAxi4Config
@@ -429,36 +432,22 @@ class MissSpikeCtrl extends Component {
     private val missSpikeFork = StreamFork2(io.missSpikeData)
     private val dataFifo = missSpikeFork._1.queue(cacheReadDelay+2) // 1 for fifo, 1 for RAW counters update
     private val writeDataSrc  = StreamDemux(dataFifo, dataFifo.cover.asUInt, 2)
-    private val busHeaderSrc  = StreamFork(missSpikeFork._2.takeWhen(missSpikeFork._2.isFirst), 4)
+    private val busHeaderSrc  = StreamFork(missSpikeFork._2.takeWhen(missSpikeFork._2.isFirst), 4, synchronous = true)
 
     val spikeReadQueue = busHeaderSrc(0).throwWhen(busHeaderSrc(0).cover).queue(2)
     val spikeWriteQueue = busHeaderSrc(1).queue(2)
     val writeHeader = busHeaderSrc(2)
     val readHeader = busHeaderSrc(3).throwWhen(busHeaderSrc(3).cover)
 
-    val coverWrite = writeDataSrc(1)
     val replaceWrite = writeDataSrc(0)
+    val coverWrite = writeDataSrc(1)
 
-    spikeReadQueue.ready := io.cache.readRsp.fire && io.cache.readRsp.last
+    val readRspLsatFire = io.cache.readRsp.fire && io.cache.readRsp.last
+    spikeReadQueue.ready := readRspLsatFire
   }
 
-  val axi = new Area {
+  val replaceRawConstrain = new Area {
     import spikeFork._
-
-    io.cache.readCmd.arbitrationFrom(readHeader)
-    io.cache.readCmd.addr := readHeader.cacheAddressBase
-    io.cache.readCmd.size := Axi4.size.BYTE_8.asUInt
-    io.cache.readCmd.burst := Axi4.burst.INCR
-    io.cache.readCmd.len := readHeader.len.resized
-    if(axi4Config.useId) io.cache.readCmd.id := 0
-
-    io.cache.writeCmd.arbitrationFrom(writeHeader)
-    io.cache.writeCmd.addr := writeHeader.cacheAddressBase
-    io.cache.writeCmd.size := Axi4.size.BYTE_8.asUInt
-    io.cache.writeCmd.burst := Axi4.burst.INCR
-    io.cache.writeCmd.len := writeHeader.len.resized
-    if(axi4Config.useId) io.cache.writeCmd.id := 0
-
     val readRspCounter, writeDataCounter= Counter(cacheLenMax)
     when(io.cache.readRsp.fire) {
       when(io.cache.readRsp.last) {
@@ -475,12 +464,53 @@ class MissSpikeCtrl extends Component {
       }
     }
 
-    val replaceWriteConsistency = replaceWrite.haltWhen(
-      readRspCounter===writeDataCounter
+    val fsm = new StateMachine{
+      val underConstrain = new State with EntryPoint
+      val writeOver = new State
+      val readOver = new State
+
+      underConstrain
+        .whenIsActive{
+          switch(replaceWrite.lastFire ## readRspLsatFire){
+            is(B"01"){ goto(readOver) }
+            is(B"10"){ goto(writeOver)}
+          }
+        }
+      writeOver
+        .whenIsActive{
+          when(readRspLsatFire) { goto(underConstrain) }
+        }
+      readOver
+        .whenIsActive{
+          when(replaceWrite.lastFire){ goto(underConstrain) }
+        }
+    }
+    val output = replaceWrite.haltWhen(
+      fsm.isActive(fsm.writeOver) ||
+        (fsm.isActive(fsm.underConstrain) && readRspCounter===writeDataCounter)
     )
+    val haltReadRsp = fsm.isActive(fsm.readOver) && io.cache.readRsp.last
+  }
+
+  val axi = new Area {
+    import spikeFork._
+
+    io.cache.readCmd.arbitrationFrom(readHeader)
+    io.cache.readCmd.addr := readHeader.cacheAddressBase
+    io.cache.readCmd.size := Axi4.size.BYTE_8.asUInt
+    io.cache.readCmd.burst := Axi4.burst.INCR
+    io.cache.readCmd.len := readHeader.replaceSpike.len.resized
+    if(axi4Config.useId) io.cache.readCmd.id := 0
+
+    io.cache.writeCmd.arbitrationFrom(writeHeader)
+    io.cache.writeCmd.addr := writeHeader.cacheAddressBase
+    io.cache.writeCmd.size := Axi4.size.BYTE_8.asUInt
+    io.cache.writeCmd.burst := Axi4.burst.INCR
+    io.cache.writeCmd.len := writeHeader.len.resized
+    if(axi4Config.useId) io.cache.writeCmd.id := 0
 
     val writeData = StreamArbiterFactory.fragmentLock.on(
-      Seq(replaceWriteConsistency, coverWrite)
+      Seq(replaceRawConstrain.output, coverWrite)
     )
     io.cache.writeData.arbitrationFrom(writeData)
     io.cache.writeData.data := writeData.data
@@ -488,11 +518,12 @@ class MissSpikeCtrl extends Component {
     io.cache.writeData.strb := writeData.last ? writeData.lastByteMask | B(0xFF)
   }
 
-  io.writeBackSpikeData << io.cache.readRsp.translateWith{
+  io.writeBackSpikeData << io.cache.readRsp.haltWhen(replaceRawConstrain.haltReadRsp).translateWith{
+    import spikeFork.spikeReadQueue
     val ret = cloneOf(io.writeBackSpikeData.payload)
     ret.last := io.cache.readRsp.last
     ret.data := io.cache.readRsp.data
-    ret.fragment.assignUnassignedByName(spikeFork.spikeReadQueue.fragment)
+    ret.fragment.assignSomeByName(spikeReadQueue.replaceSpike)
     ret
   }
 

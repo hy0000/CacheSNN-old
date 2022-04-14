@@ -1,6 +1,6 @@
 package cachesnn
 
-import cachesnn.Synapse.{GlobalAddress, cacheAxi4Config, neuronSize, threads}
+import cachesnn.Synapse.{GlobalAddress, cacheAxi4Config, cacheLenMax, neuronSize, threads}
 import cachesnn.Cache._
 import org.scalatest.funsuite.AnyFunSuite
 import spinal.core._
@@ -326,7 +326,9 @@ case class SpikeSim(nid:Int,
                     cacheAddressBase:Int = 0,
                     tagState: TagState.E = TagState.AVAILABLE,
                     cover:Boolean = false,
-                    data:BigInt = 0
+                    data:BigInt = 0,
+                    replaceLen:Int = 0,
+                    replaceNid:Int = 0
                    ){
   def pruneToReadySpike:SpikeSim = {
     val defaultSpike = SpikeSim(0)
@@ -334,10 +336,21 @@ case class SpikeSim(nid:Int,
       dirty = defaultSpike.dirty,
       tagState = defaultSpike.tagState,
       cover = defaultSpike.cover,
-      data = defaultSpike.data
+      data = defaultSpike.data,
+      replaceNid = defaultSpike.replaceNid,
+      replaceLen = defaultSpike.replaceLen
     )
   }
   def dataSeq:Seq[BigInt] = (0 to len).map(_ + (nid.toLong<<32).toBigInt)
+  def replaceBy(spike:SpikeSim): SpikeSim ={
+    spike.copy(
+      cacheAddressBase = cacheAddressBase,
+      replaceNid = nid,
+      replaceLen = len,
+      tagState = TagState.REPLACE,
+      cover = false
+    )
+  }
 }
 object SpikeSim{
   def apply[S<:Spike](spike:S): SpikeSim ={
@@ -395,6 +408,8 @@ case class SpikeDriver[T<:Data](port:Stream[T], clockDomain: ClockDomain){
             missSpike.cover #= spikeSim.cover
             missSpike.data #= data
             missSpike.lastWordMask #= 0xF
+            missSpike.replaceSpike.len #= spikeSim.replaceLen
+            missSpike.replaceSpike.nid #= spikeSim.replaceNid
         }
       }
     }
@@ -449,7 +464,15 @@ class SpikeTagFilterTest extends AnyFunSuite {
         assertMiss(spike, tagState)
       }
     }
-    def assertReplace(spikes:Seq[SpikeSim]): Unit ={
+    def assertReplace(spikes:Seq[SpikeSim], replacedSpike:Seq[SpikeSim]): Unit ={
+      fork{
+        for(rs <- replacedSpike){
+          dut.clockDomain.waitSamplingWhere(
+            dut.io.missSpike.valid.toBoolean && dut.io.missSpike.ready.toBoolean
+          )
+          assert(dut.io.missSpike.replaceNid.toInt==rs.nid)
+        }
+      }
       assertMiss(spikes, TagState.REPLACE)
     }
     def assertAvailable(spikes:Seq[SpikeSim]): Unit ={
@@ -495,7 +518,7 @@ class SpikeTagFilterTest extends AnyFunSuite {
       val noReplaceSpikes = spikes.drop(spikes.length/2)
       spikeDriver.setTimeStamp(0)
       spikeDriver.send(replaceSpikes)
-      driver.assertReplace(replaceSpikes)
+      driver.assertReplace(replaceSpikes, spikes.take(spikes.length/2))
 
       // test replaced spikes
       tagRam.clearLock()
@@ -516,7 +539,7 @@ class SpikeTagFilterTest extends AnyFunSuite {
       spikeDriver.setTimeStamp(3)
       val reReplaceSpikes = spikes.take(spikes.length/2)
       spikeDriver.send(reReplaceSpikes)
-      driver.assertReplace(reReplaceSpikes)
+      driver.assertReplace(reReplaceSpikes, replaceSpikes)
     }
   }
   test("dirty test"){
@@ -538,7 +561,7 @@ class SpikeTagFilterTest extends AnyFunSuite {
         }
       }
 
-      driver.assertReplace(conflictSpikes)
+      driver.assertReplace(conflictSpikes, dirtySpikes)
       dirtyAssertion.join()
     }
   }
@@ -732,10 +755,13 @@ class MissSpikeCtrlTest extends AnyFunSuite {
     }
 
     // no stuck assertion
-    fork{
+    val noStuckAssertion = fork{
       while(true){
         dut.clockDomain.waitSamplingWhere(dut.io.missSpikeData.valid.toBoolean)
-        assert(dut.io.missSpikeData.ready.toBoolean)
+        if(!dut.io.missSpikeData.ready.toBoolean){
+          dut.clockDomain.waitSampling()
+          assert(dut.io.missSpikeData.ready.toBoolean)
+        }
       }
     }
     def waitAllSpikesReady(): Unit ={
@@ -743,7 +769,34 @@ class MissSpikeCtrlTest extends AnyFunSuite {
         dut.clockDomain.waitRisingEdge()
       }
     }
+    def assertWriteBackSpikeData(replaceSpike: Seq[SpikeSim]): Unit ={
+      for(s <- replaceSpike){
+        assertWriteBackSpikeData(s)
+      }
+    }
+    def assertWriteBackSpikeData(replaceSpike:SpikeSim): Unit ={
+      for(data <- replaceSpike.dataSeq){
+        dut.clockDomain.waitSamplingWhere(
+          dut.io.writeBackSpikeData.valid.toBoolean && dut.io.writeBackSpikeData.ready.toBoolean
+        )
+        assert(
+          dut.io.writeBackSpikeData.nid.toInt==replaceSpike.nid,
+          f"${dut.io.writeBackSpikeData.nid.toInt}, ${replaceSpike.nid}"
+        )
+        assert(
+          dut.io.writeBackSpikeData.len.toInt==replaceSpike.len,
+          f"${dut.io.writeBackSpikeData.len.toInt}, ${replaceSpike.len}"
+        )
+        assert(
+          dut.io.writeBackSpikeData.data.toBigInt==data,
+          f"${dut.io.writeBackSpikeData.data.toBigInt.hexString()}, ${data.hexString()}"
+        )
+      }
+    }
   }
+
+  def randomLen = Random.nextInt(127)
+  def randomNid = Random.nextInt(neuronSize)
 
   test("exception: available with not cover"){
     intercept[Throwable]{
@@ -777,9 +830,10 @@ class MissSpikeCtrlTest extends AnyFunSuite {
       SimTimeout(100000)
       val driver = MissSpikeCtrlDriver(dut)
       import driver.{spikeDriver, readySpikeMonitorQueue}
-
+      driver.noStuckAssertion.terminate()
       val spikes = (0 until cacheLines).map{i=>
-        SpikeSim(i, len = 64, cacheAddressBase = i<<3, tagState = TagState.REPLACE, cover = false)
+        // read len should shorter than write len this test to avoid stuck
+        SpikeSim(i, len = 64, cacheAddressBase = i<<3, tagState = TagState.REPLACE, replaceLen = Random.nextInt(64))
       }
       spikeDriver.send(spikes)
       readySpikeMonitorQueue ++= spikes.map(_.pruneToReadySpike)
@@ -795,7 +849,7 @@ class MissSpikeCtrlTest extends AnyFunSuite {
 
       val spikes = Seq.fill(neuronSize)(Random.nextInt(neuronSize)).map{i=>
         val len = 32 + Random.nextInt(64)  // too small burst len will trigger stall
-        val spikeBase = SpikeSim(i, len = len, cacheAddressBase = i<<3)
+        val spikeBase = SpikeSim(i, len = len, cacheAddressBase = i<<3, replaceLen = len)
         if(Random.nextBoolean()){
           spikeBase.copy(tagState = TagState.AVAILABLE, cover = true)
         }else{
@@ -808,25 +862,31 @@ class MissSpikeCtrlTest extends AnyFunSuite {
     }
   }
   test("RAW hazard test"){
-    complied.doSim{ dut =>
+    complied.doSim { dut =>
       dut.clockDomain.forkStimulus(2)
-      SimTimeout(1000000)
+      SimTimeout(10000000)
       val driver = MissSpikeCtrlDriver(dut)
       import driver.{spikeDriver, readySpikeMonitorQueue}
+      driver.noStuckAssertion.terminate()
+      StreamReadyRandomizer(dut.io.readySpike, dut.clockDomain)
+      StreamReadyRandomizer(dut.io.writeBackSpikeData, dut.clockDomain)
 
-      val cacheAddress = (8 KiB).toInt
-      val initSpike = SpikeSim(0, len = 127, cacheAddressBase = cacheAddress, tagState = TagState.AVAILABLE, cover = true)
-      spikeDriver.send(initSpike)
-      val replaceSpike = initSpike.copy(tagState = TagState.REPLACE, cover = false)
-      spikeDriver.send(replaceSpike)
-      readySpikeMonitorQueue ++= Seq(initSpike.pruneToReadySpike, replaceSpike.pruneToReadySpike)
-      for(data <- initSpike.dataSeq){
-        dut.clockDomain.waitSamplingWhere(dut.io.writeBackSpikeData.valid.toBoolean)
-        assert(
-          dut.io.writeBackSpikeData.data.toBigInt==data,
-          f"${dut.io.writeBackSpikeData.data.toBigInt.hexString()}, ${data.hexString()}"
+      for(_ <- 0 until 16){
+        val cacheAddress = Random.shuffle(
+          (0 until cacheLines).map(_<<10)
         )
+        val initSpike = cacheAddress.map( addr =>
+          SpikeSim(randomNid, len = randomLen, cacheAddressBase = addr, tagState = TagState.AVAILABLE, cover = true)
+        )
+        spikeDriver.send(initSpike)
+        readySpikeMonitorQueue ++= initSpike.map(_.pruneToReadySpike)
+
+        val replaceSpike = initSpike.map(_.replaceBy(SpikeSim(nid = randomNid, len = randomLen)))
+        spikeDriver.send(replaceSpike)
+        readySpikeMonitorQueue ++= replaceSpike.map(_.pruneToReadySpike)
+        driver.assertWriteBackSpikeData(initSpike)
       }
+      driver.waitAllSpikesReady()
     }
   }
 }
