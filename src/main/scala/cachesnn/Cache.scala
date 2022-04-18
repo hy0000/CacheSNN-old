@@ -685,7 +685,7 @@ class CacheFlushCtrl extends Component {
   }
 
   val fsm = new StateMachine{
-    val idle = new State with EntryPoint
+    val idle = makeInstantEntry()
     val clearSsn = new State
     val stallSpike = new State
     val lockTags = new State
@@ -706,6 +706,9 @@ class CacheFlushCtrl extends Component {
       .whenIsActive{
         when(io.flush.valid){ goto(clearSsn) }
       }
+      .onEntry{
+        io.flush.ready := True
+      }
     clearSsn
       .whenIsActive{
         when(io.ssnClear.ready){ goto(stallSpike) }
@@ -725,6 +728,8 @@ class CacheFlushCtrl extends Component {
       .whenIsActive {
         when(io.tagRamBus.readRsp.valid && rspNeedFlush) {
           goto(sendFlushSpikes)
+        }elsewhen tagReadAddress.willOverflow {
+          goto(idle)
         }
         io.tagRamBus.readCmd.valid := True
       }
