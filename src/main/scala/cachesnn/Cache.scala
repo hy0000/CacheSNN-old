@@ -225,6 +225,8 @@ class SpikeTagFilter extends Component {
     val tagRamBus = master(TagRamBus())
     val missSpike = master(Stream(new MissSpike))
     val readySpike = master(Stream(new ReadySpike))
+    val idle = out Bool()
+    val rollBackSpike = master Stream MetaSpikeT()
   }
 
   case class WaySelFolder() extends Bundle{
@@ -235,10 +237,8 @@ class SpikeTagFilter extends Component {
     def isRollBackState:Bool = state===LOCKED || state===FAIL
     def isMissState:Bool = state===AVAILABLE || state===REPLACE
   }
-  val spikeRollBackFifo = StreamFifo(MetaSpikeT(), oooLengthMax-wayCount)
 
-  val metaSpike = StreamArbiterFactory.roundRobin
-    .on(Seq(io.metaSpike, spikeRollBackFifo.io.pop))
+  val metaSpike = io.metaSpike
   val spikeBuffer = Reg(metaSpike.payload)
   val stepCmd = Counter(tagStep, io.tagRamBus.readCmd.fire)
   val stepRsp= Counter(tagStep, io.tagRamBus.readRsp.fire)
@@ -249,7 +249,6 @@ class SpikeTagFilter extends Component {
   io.tagRamBus.readRsp.ready := True
   metaSpike.ready := False
   rspEvent.valid := False
-
 
   val tagDetect = new Area{
     val tags = io.tagRamBus.readRsp.payload
@@ -348,7 +347,7 @@ class SpikeTagFilter extends Component {
 
   val (toTagUpdateSpike, toReadySpike, toMissSpike, toRollBackSpike) = {
     import tagDetect.waySelFolder
-    val ret = StreamFork(rspEvent, 4, synchronous = true)
+    val ret = StreamFork(rspEvent, 4)
     (
       ret(0).throwWhen(waySelFolder.isRollBackState),
       ret(1).takeWhen(waySelFolder.state===TagState.HIT),
@@ -357,7 +356,7 @@ class SpikeTagFilter extends Component {
     )
   }
 
-  val outputAssign = new Area{
+  val outputAssign = new Area {
     import tagDetect.waySelFolder
     val cacheAddressBase = (spikeBuffer.nid(setIndexRange) @@ waySelFolder.way) << log2Up(cacheLineSize)
 
@@ -393,13 +392,14 @@ class SpikeTagFilter extends Component {
       ret
     }
 
-    spikeRollBackFifo.io.push << toRollBackSpike.translateWith{
+    io.rollBackSpike << toRollBackSpike.translateWith{
       val ret = MetaSpikeT()
       ret.assignAllByName(spikeBuffer)
       ret
     }
-  }
 
+    io.idle := fsm.isActive(fsm.idle)
+  }
 }
 
 trait SpikeCacheData extends Bundle {
@@ -668,36 +668,132 @@ class SpikeOrderCtrl extends Component {
 
 class CacheFlushCtrl extends Component {
   val io = new Bundle {
-    val flushThread = slave(Stream(UInt(log2Up(threads) bits)))
-    val flushAck = out Bool()
+    val flush = slave(Stream(ThreadFlush()))
+    val ssnClear = master(Stream(UInt(log2Up(threads) bits)))
+    val notSpikeInPath = in Bool()
+    val stallSpikePath = out Bool()
     val tagRamBus = master(TagRamBus())
-    val cache = master(Axi4ReadOnly(cacheAxi4Config))
-    val writeBackSpikeData = master(Stream(Fragment(MetaSpikeWithData())))
+    val flushSpike = master(Stream(Fragment(MissSpikeWithData())))
   }
 
-  val thread = RegNextWhen(io.flushThread.payload, io.flushThread.ready)
-  val flushMask = B(io.tagRamBus.readRsp.payload.map(_.thread===thread))
-  val flushCounter = Counter(tagRamAddressWidth bits, io.tagRamBus.readCmd.fire)
-  val flushing = RegInit(False)
-    .riseWhen(io.flushThread.fire)
-    .fallWhen(flushCounter.willOverflow)
-  val doWriteBack = RegInit(False)
-    .riseWhen(flushMask.orR)
-    .fallWhen(io.cache.readRsp.last && io.cache.readRsp.fire)
+  val tagReadAddress = Counter(tagRamAddressWidth bits, io.tagRamBus.readCmd.fire)
+  val tagWriteAddress = Counter(tagRamAddressWidth bits, io.tagRamBus.writeCmd.fire)
+  def tagsThreadMatchedOh(tags:Vec[Tag]):Vec[Bool] = Vec(tags.map(tag => tag.valid && tag.thread===io.flush.thread))
 
-  io.tagRamBus.readCmd.valid := flushing
-  io.tagRamBus.readCmd.payload := flushCounter
+  when(RegNext(io.tagRamBus.readCmd.fire) init False){
+    assert(io.tagRamBus.readRsp.valid, "tagRam dont rsp immediately at CacheFlushCtrl", ERROR)
+  }
 
-  val flushWrite = io.tagRamBus.readRsp.translateWith{
+  val fsm = new StateMachine{
+    val idle = new State with EntryPoint
+    val clearSsn = new State
+    val stallSpike = new State
+    val lockTags = new State
+    val tagRead = new State
+    val sendFlushSpikes = new State
+
+    val rspToLock = RegNext(this.isActive(lockTags))
+    val rspNeedFlush = tagsThreadMatchedOh(io.tagRamBus.readRsp.payload).orR
+    val rspToInvalidIsFree = Bool()
+    io.flush.ready := False
+    io.ssnClear.valid := False
+    io.ssnClear.payload := io.flush.thread
+    io.stallSpikePath := False
+    io.tagRamBus.readCmd.valid := False
+    io.tagRamBus.readCmd.payload := tagReadAddress.value
+
+    idle
+      .whenIsActive{
+        when(io.flush.valid){ goto(clearSsn) }
+      }
+    clearSsn
+      .whenIsActive{
+        when(io.ssnClear.ready){ goto(stallSpike) }
+        io.ssnClear.valid := True
+      }
+    stallSpike
+      .whenIsActive{
+        when(io.notSpikeInPath){ goto(lockTags) }
+        io.stallSpikePath := True
+      }
+    lockTags
+      .whenIsActive{
+        when(tagReadAddress.willOverflow){ goto(tagRead) }
+        io.tagRamBus.readCmd.valid := True
+      }
+    tagRead
+      .whenIsActive {
+        when(io.tagRamBus.readRsp.valid && rspNeedFlush) {
+          goto(sendFlushSpikes)
+        }
+        io.tagRamBus.readCmd.valid := True
+      }
+    sendFlushSpikes
+      .whenIsActive{
+        when(tagWriteAddress.willOverflow) {
+          goto(idle)
+        }elsewhen rspToInvalidIsFree {
+          goto(tagRead)
+        }
+      }
+  }
+
+  val readRspDe = new Area {
+    val (toLock, toInvalid) = {
+      val ret = StreamDemux(io.tagRamBus.readRsp.stage(), fsm.rspToLock.asUInt, 2)
+      (ret(0), ret(1))
+    }
+    fsm.rspToInvalidIsFree := toLock.isFree
+  }
+
+  val lockTagRamWrite = readRspDe.toLock.translateWith{
     val ret = cloneOf(io.tagRamBus.writeCmd.payload)
-    ret.address := RegNextWhen(flushCounter.asBits.asUInt, io.tagRamBus.readCmd.ready)
-    ret.tags := ret.tags.getZero
-    ret.wayMask := flushMask
+    ret.address := tagWriteAddress
+    for((tag, rspTag) <- ret.tags.zip(readRspDe.toLock.payload)){
+      tag.lock := True
+      tag.assignUnassignedByName(rspTag)
+    }
+    ret.wayMask := tagsThreadMatchedOh(readRspDe.toLock.payload).asBits
     ret
-  }.stage().haltWhen(doWriteBack)
+  }
 
-  io.tagRamBus.writeCmd << flushWrite.takeWhen(flushMask.orR)
-  io.flushAck := !flushing && flushWrite.fire  // ack at last flush item
+  case class TagWay() extends Bundle {
+    val tag = Tag()
+    val wayLow = UInt(log2Up(wayCountPerStep) bits)
+  }
+  val invalidSeqOut = StreamArbiterFactory.on(
+    StreamFork(readRspDe.toInvalid.stage(), wayCountPerStep)
+      .zipWithIndex
+      .map{case (s, wayLow) =>
+        val tag = s.payload(wayLow)
+        s.takeWhen(tag.valid && tag.thread===io.flush.thread).translateWith {
+          val ret = TagWay()
+          ret.tag := tag
+          ret.wayLow := wayLow
+          ret
+        }
+      }
+  )
+
+  val (invalidToTagRam, invalidToCache) = StreamFork2(invalidSeqOut)
+
+  val invalidTagRamWrite = invalidToTagRam.translateWith {
+    val ret = cloneOf(io.tagRamBus.writeCmd.payload)
+    ret.address := tagWriteAddress
+    ret.tags := ret.tags.getZero
+    ret.wayMask := UIntToOh(invalidToTagRam.wayLow)
+    ret
+  }
+  io.tagRamBus.writeCmd << StreamArbiterFactory.on(Seq(lockTagRamWrite, invalidTagRamWrite))
+  io.flushSpike << invalidToCache.translateWith{
+    val ret = cloneOf(io.flushSpike.fragment)
+    ret.replaceSpike.len := io.flush.len
+    ret.replaceSpike.lastWordMask := 1<<(busDataWidth/16)-1
+    ret.replaceSpike.nid := invalidToCache.tag.tag @@ tagWriteAddress.value>>log2Up(tagStep)
+    ret.tagState := TagState.REPLACE
+    ret.assignUnassignedByName(ret.getZero)
+    ret
+  }.addFragmentLast(True)
 }
 
 class CacheDataCtrl extends Component {
@@ -706,49 +802,52 @@ class CacheDataCtrl extends Component {
     val metaSpike = slave(Stream(MetaSpikeT()))
     val missSpike = master(Stream(new MissSpike))
     val refractory = in UInt(tagTimeStampWidth bits)
-    val ssnClear = slave(Stream(UInt(log2Up(threads) bits)))
-    val flushThread = slave(Stream(UInt(log2Up(threads) bits)))
-    val flushAck = out Bool()
+    val flush = slave(Stream(ThreadFlush()))
     val writeBackSpikeData = master(Stream(Fragment(MetaSpikeWithData())))
     val missSpikeData = slave(Stream(Fragment(MissSpikeWithData())))
     val readySpike = master(Stream(ReadySpike()))
     val cache = master(Axi4(cacheAxi4Config))
-    val cacheFlush = master(Axi4ReadOnly(cacheAxi4Config))
   }
 
   val spikeTagFilter = new SpikeTagFilter
   val missSpikeCtrl = new MissSpikeCtrl
   val spikeOrderCtrl = new SpikeOrderCtrl
   val cacheFlushCtrl = new CacheFlushCtrl
+  val rollBackSpikeFifo = StreamFifo(MetaSpikeT(), oooLengthMax-wayCount)
 
   io.metaSpike >> spikeOrderCtrl.io.sequentialInSpike
   io.ackSpike  >> spikeOrderCtrl.io.oooAckSpike
-  io.ssnClear >> spikeOrderCtrl.io.ssnClear
 
-  spikeTagFilter.io.metaSpike  << spikeOrderCtrl.io.metaSpikeWithSsn
-  spikeTagFilter.io.refractory := io.refractory
-  spikeTagFilter.io.missSpike  >> io.missSpike
+  val spikeWithSsn = StreamArbiterFactory.roundRobin.on(
+    Seq(spikeOrderCtrl.io.metaSpikeWithSsn, rollBackSpikeFifo.io.pop)
+  ).haltWhen(cacheFlushCtrl.io.stallSpikePath)
 
-  missSpikeCtrl.io.missSpikeData << io.missSpikeData
-  missSpikeCtrl.io.cache         <> io.cache
+  spikeTagFilter.io.metaSpike     << spikeWithSsn
+  spikeTagFilter.io.refractory    := io.refractory
+  spikeTagFilter.io.missSpike     >> io.missSpike
+  spikeTagFilter.io.rollBackSpike >> rollBackSpikeFifo.io.push
 
-  io.flushThread >> cacheFlushCtrl.io.flushThread
-  io.flushAck    := cacheFlushCtrl.io.flushAck
-  io.cacheFlush  <> cacheFlushCtrl.io.cache
+  val missSpikeData = StreamArbiterFactory.lowerFirst.on(
+    Seq(cacheFlushCtrl.io.flushSpike, io.missSpikeData)
+  )
+
+  missSpikeCtrl.io.missSpikeData      << missSpikeData
+  missSpikeCtrl.io.writeBackSpikeData >> io.writeBackSpikeData
+  missSpikeCtrl.io.cache              <> io.cache
 
   io.readySpike << StreamArbiterFactory.roundRobin.on(
     Seq(spikeTagFilter.io.readySpike, missSpikeCtrl.io.readySpike)
-  ).queue(cacheLines)
+  ).queue(cacheLines) //TODO: move this to readySpikeManagement if it's designed
 
-  io.writeBackSpikeData << StreamArbiterFactory.fragmentLock.on(
-    Seq(cacheFlushCtrl.io.writeBackSpikeData, missSpikeCtrl.io.writeBackSpikeData)
-  )
+  cacheFlushCtrl.io.flush          << io.flush
+  cacheFlushCtrl.io.ssnClear       >> spikeOrderCtrl.io.ssnClear
+  cacheFlushCtrl.io.notSpikeInPath := spikeTagFilter.io.idle
 
   val tagRam = Seq.fill(wayCountPerStep)(
     Mem(Tag(), cacheLines/wayCountPerStep)
   )
 
-  val tagRamBusArbitration = {
+  val tagRamBusArbitration = new Area {
     val tagRamBusPrioritySeq = Seq(
       cacheFlushCtrl.io.tagRamBus,
       spikeOrderCtrl.io.tagRamBus,
@@ -836,5 +935,37 @@ class CacheDataPacker extends Component {
 
 object CacheVerilog extends App {
   //SpinalVerilog(Axi4UramBank(64, 32 KiB, 2))
-  SpinalVerilog(new SpikeTagFilter)
+  SpinalVerilog(new CacheDataCtrl)
 }
+/*
+object Solution extends App{
+  case class Bg(find:Boolean, shu:BigInt)
+  def doBg(x:Int, y:Int): Bg={
+    val shu = x.toBigInt * y.toBigInt
+    val shuStr = shu.toString()
+    Bg(shuStr==shuStr.reverse, shu)
+  }
+  def dp(nMax:Int, n:Int=0, shu:BigInt=0):BigInt = {
+    if(n==nMax){
+      shu
+    }else{
+      var bg = Bg(find = false, shu)
+      val hh = 1<<n
+      val hl = 1<<(n-1)
+      for(y <- (hl until hh).reverse if !bg.find){
+        for(x1 <- (y until hh).reverse if !bg.find){
+          bg = doBg(x1, y)
+        }
+      }
+      for(y <- (1 until hl).reverse if !bg.find){
+        for(x2 <- (hl until hh).reverse if !bg.find){
+          bg = doBg(x2, y)
+        }
+      }
+    }
+  }
+  def largestPalindrome(n: Int): Int = {
+    (dp(nMax = n) % 1337).toInt
+  }
+}
+ */

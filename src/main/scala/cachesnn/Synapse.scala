@@ -183,6 +183,11 @@ case class AckSpike() extends Spike {
   val dirty = Bool()
 }
 
+case class ThreadFlush() extends Bundle {
+  val thread = UInt(log2Up(threads) bits)
+  val len = UInt(cacheLenWidth bits)
+}
+
 class Synapse extends Component {
   val inKeep = slave(Stream(ReadySpike()))
   val outKeep = master(Stream(Bool()))

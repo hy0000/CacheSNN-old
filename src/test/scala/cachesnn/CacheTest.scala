@@ -1,6 +1,6 @@
 package cachesnn
 
-import cachesnn.Synapse.{GlobalAddress, cacheAxi4Config, cacheLenMax, neuronSize, threads}
+import cachesnn.Synapse.{GlobalAddress, busDataWidth, cacheAxi4Config, cacheLenMax, neuronSize, threads}
 import cachesnn.Cache._
 import org.scalatest.funsuite.AnyFunSuite
 import spinal.core._
@@ -237,10 +237,10 @@ case class TagRamSim(bus:TagRamBus, clockDomain: ClockDomain) {
   val ram = Array.tabulate(size,wayCountPerStep)((_,_) =>TagSim())
 
   val (rspDriver, rspQueue) = StreamDriver.queue(bus.readRsp, clockDomain)
-  StreamReadyRandomizer(bus.readCmd, clockDomain)
-  StreamReadyRandomizer(bus.writeCmd, clockDomain)
-  //bus.readCmd.ready #= true
-  //bus.writeCmd.ready #= true
+  val readReady = StreamReadyRandomizer(bus.readCmd, clockDomain)
+  val writeReady = StreamReadyRandomizer(bus.writeCmd, clockDomain)
+  bus.readCmd.ready #= true
+  bus.writeCmd.ready #= true
   StreamMonitor(bus.readCmd, clockDomain){ addr=>
     val rsp = ram(addr.toInt)
     rspQueue.enqueue{tags=>
@@ -271,6 +271,11 @@ case class TagRamSim(bus:TagRamBus, clockDomain: ClockDomain) {
     }
   }
 
+  def setAlwaysReady(): Unit ={
+    writeReady.factor = Float.PositiveInfinity
+    readReady.factor = Float.PositiveInfinity
+  }
+
   def updateAll(op: TagSim => TagSim):Unit = {
     for(i <- 0 until size){
       for(j <- 0 until wayCountPerStep){
@@ -278,7 +283,6 @@ case class TagRamSim(bus:TagRamBus, clockDomain: ClockDomain) {
       }
     }
   }
-
   def flush(): Unit ={
     updateAll(_=>TagSim())
   }
@@ -294,7 +298,7 @@ case class TagRamSim(bus:TagRamBus, clockDomain: ClockDomain) {
       val wayId = way & wayMask
       val address = (setId<<setIdOffset) | (way>>wayIdOffset)
       val tag = spike.nid>>setIndexRange.size
-      ram(address)(wayId) = TagSim(tag = tag, valid = true, dirty =  spike.dirty)
+      ram(address)(wayId) = TagSim(tag = tag, valid = true, dirty =  spike.dirty, thread = spike.thread)
       wayOccupancy(setId) += 1
     }
   }
@@ -314,6 +318,11 @@ case class TagRamSim(bus:TagRamBus, clockDomain: ClockDomain) {
     ram.map(
       _.map(_.valid.toInt).sum
     ).grouped(tagStep).map(_.sum).toArray
+  }
+  def waitAWrite(): Unit ={
+    if(bus.writeCmd.valid.toBoolean){
+      clockDomain.waitSamplingWhere(bus.writeCmd.ready.toBoolean)
+    }
   }
 }
 
@@ -423,18 +432,15 @@ case class SpikeDriver[T<:Data](port:Stream[T], clockDomain: ClockDomain){
 
 class SpikeTagFilterTest extends AnyFunSuite {
   val compiled = SimConfig.compile(new SpikeTagFilter)
-  val compiledWithInnerFifo = SimConfig.compile{
-    val ret = new SpikeTagFilter
-    ret.spikeRollBackFifo.io.simPublic()
-    ret
-  }
 
   case class SpikeTagFilterDrivers(dut:SpikeTagFilter){
     val tagRam = TagRamSim(dut.io.tagRamBus, dut.clockDomain)
     val spikeDriver = SpikeDriver(dut.io.metaSpike, dut.clockDomain)
     StreamReadyRandomizer(dut.io.missSpike, dut.clockDomain)
     StreamReadyRandomizer(dut.io.readySpike, dut.clockDomain)
+    StreamReadyRandomizer(dut.io.rollBackSpike, dut.clockDomain)
     dut.io.refractory #= 1
+
     private val nidBase = 0//Random.nextInt(neuronSize-cacheLines)
     val spikes = (nidBase until nidBase+cacheLines).map(nid => SpikeSim(nid))
     val conflictSpikes = spikes.map{spike =>
@@ -477,6 +483,17 @@ class SpikeTagFilterTest extends AnyFunSuite {
     }
     def assertAvailable(spikes:Seq[SpikeSim]): Unit ={
       assertMiss(spikes, TagState.AVAILABLE)
+    }
+    def assertRollBack(spike:SpikeSim): Unit ={
+      dut.clockDomain.waitSamplingWhere(
+        dut.io.rollBackSpike.valid.toBoolean && dut.io.rollBackSpike.ready.toBoolean
+      )
+      assert(dut.io.rollBackSpike.nid.toInt==spike.nid)
+    }
+    def assertRollBack(spikes:Seq[SpikeSim]): Unit ={
+      for(spike <- spikes){
+        assertRollBack(spike)
+      }
     }
   }
 
@@ -521,12 +538,14 @@ class SpikeTagFilterTest extends AnyFunSuite {
       driver.assertReplace(replaceSpikes, spikes.take(spikes.length/2))
 
       // test replaced spikes
+      tagRam.waitAWrite()
       tagRam.clearLock()
       spikeDriver.setTimeStamp(1)
       spikeDriver.send(replaceSpikes)
       driver.assertHit(replaceSpikes)
 
       // test no replaced spikes
+      tagRam.waitAWrite()
       tagRam.clearLock()
       spikeDriver.setTimeStamp(2)
       spikeDriver.send(noReplaceSpikes)
@@ -535,6 +554,7 @@ class SpikeTagFilterTest extends AnyFunSuite {
       // now the replace spikes with timestamp 1
       // the no replace spikes with timestamp 2
       // follow re replace spikes will take place replace spikes, default refractory is 1
+      tagRam.waitAWrite()
       tagRam.clearLock()
       spikeDriver.setTimeStamp(3)
       val reReplaceSpikes = spikes.take(spikes.length/2)
@@ -566,7 +586,7 @@ class SpikeTagFilterTest extends AnyFunSuite {
     }
   }
   test("lock test"){
-    compiledWithInnerFifo.doSim { dut =>
+    compiled.doSim { dut =>
       dut.clockDomain.forkStimulus(2)
       SimTimeout(100000)
       val driver = SpikeTagFilterDrivers(dut)
@@ -574,20 +594,11 @@ class SpikeTagFilterTest extends AnyFunSuite {
       tagRam.fillSpike(spikes)
       tagRam.setLock()
       spikeDriver.send(spikes)
-      dut.clockDomain.waitSamplingWhere(
-        !dut.spikeRollBackFifo.io.push.ready.toBoolean
-      )
-      tagRam.clearLock()
-      // rsp nid is out of order
-      for(_ <- spikes){
-        dut.clockDomain.waitSamplingWhere(
-          dut.io.readySpike.valid.toBoolean && dut.io.readySpike.ready.toBoolean
-        )
-      }
+      driver.assertRollBack(spikes)
     }
   }
   test("fail test"){
-    compiledWithInnerFifo.doSim { dut =>
+    compiled.doSim { dut =>
       dut.clockDomain.forkStimulus(2)
       SimTimeout(100000)
       val driver = SpikeTagFilterDrivers(dut)
@@ -598,17 +609,7 @@ class SpikeTagFilterTest extends AnyFunSuite {
         spike.copy(nid = (spike.nid+cacheLines)%neuronSize)
       }
       spikeDriver.send(failSpikes)
-      dut.clockDomain.waitSamplingWhere(
-        !dut.spikeRollBackFifo.io.push.ready.toBoolean
-      )
-      tagRam.clearLock()
-      // rsp nid is out of order
-      for(_ <- spikes){
-        dut.clockDomain.waitSamplingWhere(
-          dut.io.missSpike.valid.toBoolean && dut.io.missSpike.ready.toBoolean
-        )
-        assert(dut.io.missSpike.tagState.toEnum==TagState.REPLACE)
-      }
+      driver.assertRollBack(failSpikes)
     }
   }
   test("cache address test"){
@@ -887,6 +888,48 @@ class MissSpikeCtrlTest extends AnyFunSuite {
         driver.assertWriteBackSpikeData(initSpike)
       }
       driver.waitAllSpikesReady()
+    }
+  }
+}
+
+class CacheFlushCtrlTest extends AnyFunSuite {
+
+  val complied = SimConfig.withWave.compile(new CacheFlushCtrl)
+
+  case class CacheFlushCtrlDriver(dut:CacheFlushCtrl){
+    val tagRam = TagRamSim(dut.io.tagRamBus, dut.clockDomain)
+    tagRam.setAlwaysReady()
+    // io.ssnClear handle
+    fork{
+      while(true){
+        dut.io.ssnClear.ready #= false
+        dut.clockDomain.waitSamplingWhere(dut.io.ssnClear.valid.toBoolean)
+        dut.clockDomain.waitRisingEdge(Random.nextInt(666))
+        dut.io.ssnClear.ready #= true
+        dut.clockDomain.waitSampling()
+      }
+    }
+    fork{
+      while(true){
+        dut.clockDomain.waitRisingEdge(Random.nextInt(666))
+        dut.io.notSpikeInPath #= Random.nextBoolean()
+      }
+    }
+    StreamReadyRandomizer(dut.io.flushSpike, dut.clockDomain)
+
+    def flush(thread:Int): Unit ={
+      dut.io.flush.thread #= thread
+      dut.io.flush.valid #= true
+      dut.clockDomain.waitRisingEdgeWhere(dut.io.flush.ready.toBoolean)
+    }
+  }
+
+  test("flush test"){
+    complied.doSim{dut =>
+      dut.clockDomain.forkStimulus(2)
+      SimTimeout(100000)
+      val driver = CacheFlushCtrlDriver(dut)
+      driver.flush(0)
     }
   }
 }
