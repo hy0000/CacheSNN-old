@@ -13,9 +13,10 @@ import spinal.lib.fsm._
 object Cache {
   val tagTimeStampWidth = 3
   val cacheLineSize = 1 KiB
-  val cacheLines = (nCacheBank*cacheBankSize/cacheLineSize).toInt
+  val cacheLines = (nCacheBank * cacheBankSize/cacheLineSize).toInt
+  val cacheLineAddrWidth = log2Up(cacheLineSize)
   val wayCount = 16
-  val wayCountPerStep = 8
+  val wayCountPerStep = 4
   val setIndexRange = log2Up(cacheLines/wayCount)-1 downto 0
   val setSize = wayCount * 2 Byte
   val tagWidth = nidWidth - setIndexRange.size
@@ -358,7 +359,7 @@ class SpikeTagFilter extends Component {
 
   val outputAssign = new Area {
     import tagDetect.waySelFolder
-    val cacheAddressBase = (spikeBuffer.nid(setIndexRange) @@ waySelFolder.way) << log2Up(cacheLineSize)
+    val cacheAddressBase = (spikeBuffer.nid(setIndexRange) @@ waySelFolder.way) << cacheLineAddrWidth
 
     io.missSpike << toMissSpike.translateWith{
       val ret = new MissSpike
@@ -409,6 +410,7 @@ trait SpikeCacheData extends Bundle {
 case class MetaSpikeWithData() extends MetaSpike with SpikeCacheData
 case class MissSpikeWithData() extends MissSpike with SpikeCacheData{
   val replaceSpike = new MetaSpike
+  // use replaceSpike.nid instead of replaceNid, replaceNid set 0
 }
 
 class MissSpikeCtrl extends Component {
@@ -677,11 +679,14 @@ class CacheFlushCtrl extends Component {
   }
 
   val tagReadAddress = Counter(tagRamAddressWidth bits, io.tagRamBus.readCmd.fire)
-  val tagWriteAddress = Counter(tagRamAddressWidth bits, io.tagRamBus.writeCmd.fire)
+  val tagWriteAddress = Reg(UInt(tagRamAddressWidth bits))
   def tagsThreadMatchedOh(tags:Vec[Tag]):Vec[Bool] = Vec(tags.map(tag => tag.valid && tag.thread===io.flush.thread))
 
   when(RegNext(io.tagRamBus.readCmd.fire) init False){
-    assert(io.tagRamBus.readRsp.valid, "tagRam dont rsp immediately at CacheFlushCtrl", ERROR)
+    assert(
+      io.tagRamBus.readRsp.valid,
+      message = L"tagRam dont rsp immediately at CacheFlushCtrl, writeReady:${io.tagRamBus.writeCmd.ready}"
+    )
   }
 
   val fsm = new StateMachine{
@@ -690,24 +695,22 @@ class CacheFlushCtrl extends Component {
     val stallSpike = new State
     val lockTags = new State
     val tagRead = new State
-    val sendFlushSpikes = new State
+    val bufferRsp = new State
+    val sendFlushSpike = new State
+    val flushDone = new State
 
     val rspToLock = RegNext(this.isActive(lockTags))
-    val rspNeedFlush = tagsThreadMatchedOh(io.tagRamBus.readRsp.payload).orR
     val rspToInvalidIsFree = Bool()
     io.flush.ready := False
     io.ssnClear.valid := False
     io.ssnClear.payload := io.flush.thread
     io.stallSpikePath := False
     io.tagRamBus.readCmd.valid := False
-    io.tagRamBus.readCmd.payload := tagReadAddress.value
+    io.tagRamBus.readCmd.payload := tagReadAddress
 
     idle
       .whenIsActive{
         when(io.flush.valid){ goto(clearSsn) }
-      }
-      .onEntry{
-        io.flush.ready := True
       }
     clearSsn
       .whenIsActive{
@@ -722,36 +725,44 @@ class CacheFlushCtrl extends Component {
     lockTags
       .whenIsActive{
         when(tagReadAddress.willOverflow){ goto(tagRead) }
+        io.stallSpikePath := True
         io.tagRamBus.readCmd.valid := True
+        tagWriteAddress := tagReadAddress
       }
     tagRead
       .whenIsActive {
-        when(io.tagRamBus.readRsp.valid && rspNeedFlush) {
-          goto(sendFlushSpikes)
-        }elsewhen tagReadAddress.willOverflow {
-          goto(idle)
-        }
+        when(tagReadAddress.willIncrement){ goto(bufferRsp)}
         io.tagRamBus.readCmd.valid := True
+        tagWriteAddress := tagReadAddress
       }
-    sendFlushSpikes
+    bufferRsp
+      .whenIsActive{ goto(sendFlushSpike) }
+    sendFlushSpike
       .whenIsActive{
-        when(tagWriteAddress.willOverflow) {
-          goto(idle)
-        }elsewhen rspToInvalidIsFree {
-          goto(tagRead)
+        when(rspToInvalidIsFree){
+          when(tagWriteAddress===tagWriteAddress.maxValue) {
+            goto(flushDone)
+          }otherwise{
+            goto(tagRead)
+          }
         }
+      }
+    flushDone
+      .whenIsActive{
+        goto(idle)
+        io.flush.ready := True
       }
   }
 
   val readRspDe = new Area {
-    val (toLock, toInvalid) = {
-      val ret = StreamDemux(io.tagRamBus.readRsp.stage(), fsm.rspToLock.asUInt, 2)
-      (ret(0), ret(1))
+    val (toInvalid, toLock) = {
+      val ret = StreamDemux(io.tagRamBus.readRsp, fsm.rspToLock.asUInt, 2)
+      (ret(0).stage(), ret(1))
     }
-    fsm.rspToInvalidIsFree := toLock.isFree
+    fsm.rspToInvalidIsFree := toInvalid.isFree
   }
 
-  val lockTagRamWrite = readRspDe.toLock.translateWith{
+  val lockTagRamWriteThreadMatched = readRspDe.toLock.translateWith{
     val ret = cloneOf(io.tagRamBus.writeCmd.payload)
     ret.address := tagWriteAddress
     for((tag, rspTag) <- ret.tags.zip(readRspDe.toLock.payload)){
@@ -761,13 +772,14 @@ class CacheFlushCtrl extends Component {
     ret.wayMask := tagsThreadMatchedOh(readRspDe.toLock.payload).asBits
     ret
   }
+  val lockTagRamWrite = lockTagRamWriteThreadMatched.takeWhen(lockTagRamWriteThreadMatched.wayMask.orR)
 
   case class TagWay() extends Bundle {
     val tag = Tag()
     val wayLow = UInt(log2Up(wayCountPerStep) bits)
   }
   val invalidSeqOut = StreamArbiterFactory.on(
-    StreamFork(readRspDe.toInvalid.stage(), wayCountPerStep)
+    StreamFork(readRspDe.toInvalid, wayCountPerStep)
       .zipWithIndex
       .map{case (s, wayLow) =>
         val tag = s.payload(wayLow)
@@ -792,13 +804,14 @@ class CacheFlushCtrl extends Component {
   io.tagRamBus.writeCmd << StreamArbiterFactory.on(Seq(lockTagRamWrite, invalidTagRamWrite))
   io.flushSpike << invalidToCache.translateWith{
     val ret = cloneOf(io.flushSpike.fragment)
+    ret.cacheAddressBase := (tagWriteAddress @@ invalidToCache.wayLow) << cacheLineAddrWidth
     ret.replaceSpike.len := io.flush.len
     ret.replaceSpike.lastWordMask := 1<<(busDataWidth/16)-1
-    ret.replaceSpike.nid := invalidToCache.tag.tag @@ tagWriteAddress.value>>log2Up(tagStep)
+    ret.replaceSpike.nid := invalidToCache.tag.tag @@ tagWriteAddress>>log2Up(tagStep)
     ret.tagState := TagState.REPLACE
     ret.assignUnassignedByName(ret.getZero)
     ret
-  }.addFragmentLast(True)
+  }.addFragmentLast(True).takeWhen(invalidToCache.tag.dirty)
 }
 
 class CacheDataCtrl extends Component {
