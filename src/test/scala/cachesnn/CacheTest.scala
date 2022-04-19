@@ -238,7 +238,9 @@ case class TagRamSim(bus:TagRamBus, clockDomain: ClockDomain) {
 
   val (rspDriver, rspQueue) = StreamDriver.queue(bus.readRsp, clockDomain)
   rspDriver.transactionDelay = () => 0
+  rspDriver.delay = 0
   bus.readCmd.ready #= true
+  bus.readRsp.ready #= true
   // to return rsp at 1 clk, sampling on fall edge
   clockDomain.onFallingEdges{
     val ready = rspQueue.isEmpty || bus.readRsp.ready.toBoolean
@@ -807,7 +809,7 @@ class MissSpikeCtrlTest extends AnyFunSuite {
     }
   }
 
-  def randomLen = Random.nextInt(127)
+  def randomLen = Random.nextInt(127-1) + 1 // avoid 0 which is flush spike
   def randomNid = Random.nextInt(neuronSize)
 
   test("exception: available with not cover"){
@@ -901,6 +903,32 @@ class MissSpikeCtrlTest extends AnyFunSuite {
       driver.waitAllSpikesReady()
     }
   }
+  test("flush spike test"){
+    complied.doSim{ dut =>
+      dut.clockDomain.forkStimulus(2)
+      SimTimeout(1000000)
+      val driver = MissSpikeCtrlDriver(dut)
+      driver.noStuckAssertion.terminate()
+      import driver.{spikeDriver, readySpikeMonitorQueue}
+
+      val spikes = Seq.fill(neuronSize)(Random.nextInt(neuronSize)).map{i=>
+        val spikeBase = SpikeSim(i, len = randomLen, cacheAddressBase = (i%cacheLines)<<cacheLineAddrWidth, replaceLen = randomLen)
+        if(Random.nextBoolean()){
+          spikeBase.copy(tagState = TagState.AVAILABLE, cover = true)
+        }else{
+          if(Random.nextBoolean()){
+            spikeBase.copy(tagState = TagState.REPLACE, cover = Random.nextBoolean())
+          }else{
+            // flush spike
+            spikeBase.copy(tagState = TagState.REPLACE, cover = false, len = 0)
+          }
+        }
+      }
+      spikeDriver.send(spikes)
+      readySpikeMonitorQueue ++= spikes.filter(_.len!=0).map(_.pruneToReadySpike)
+      driver.waitAllSpikesReady()
+    }
+  }
 }
 
 class CacheFlushCtrlTest extends AnyFunSuite {
@@ -910,16 +938,6 @@ class CacheFlushCtrlTest extends AnyFunSuite {
   case class CacheFlushCtrlDriver(dut:CacheFlushCtrl){
     val tagRam = TagRamSim(dut.io.tagRamBus, dut.clockDomain)
     tagRam.setAlwaysReady()
-    // io.ssnClear handle
-    fork{
-      while(true){
-        dut.io.ssnClear.ready #= false
-        dut.clockDomain.waitSamplingWhere(dut.io.ssnClear.valid.toBoolean)
-        dut.clockDomain.waitRisingEdge(Random.nextInt(666))
-        dut.io.ssnClear.ready #= true
-        dut.clockDomain.waitSampling()
-      }
-    }
     fork{
       while(true){
         dut.clockDomain.waitRisingEdge(Random.nextInt(666))
@@ -1011,7 +1029,6 @@ class CacheFlushCtrlTest extends AnyFunSuite {
   def freeRunDut(dut:CacheFlushCtrl): Unit ={
     dut.io.tagRamBus.readCmd.ready #= true
     dut.io.tagRamBus.writeCmd.ready #= true
-    dut.io.ssnClear.ready #= true
     dut.io.notSpikeInPath #= true
     dut.io.flushSpike.ready #= true
   }

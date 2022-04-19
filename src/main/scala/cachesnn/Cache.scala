@@ -10,6 +10,8 @@ import spinal.lib.bus.regif.BusInterface
 import spinal.lib.bus.simple._
 import spinal.lib.fsm._
 
+import scala.reflect.internal.ReporterImpl
+
 object Cache {
   val tagTimeStampWidth = 3
   val cacheLineSize = 1 KiB
@@ -532,7 +534,7 @@ class MissSpikeCtrl extends Component {
   val writeOver = new Area{
     import spikeFork.spikeWriteQueue
     val event = StreamJoin(io.cache.writeRsp, spikeWriteQueue)
-    io.readySpike.arbitrationFrom(event)
+    io.readySpike.arbitrationFrom(event.throwWhen(spikeWriteQueue.len===0)) // write len == 0 is flush spike
     io.readySpike.payload.assignAllByName(spikeWriteQueue.fragment)
   }
 }
@@ -560,12 +562,22 @@ class SpikeOrderCtrl extends Component {
     }
   }
 
+  val (ackToClearLock, ackToSetAck) = StreamFork2(io.oooAckSpike)
+
+  io.tagRamBus.readCmd.arbitrationFrom(ackToClearLock)
+  io.tagRamBus.readCmd.payload := ackToClearLock.tagAddress
+  io.tagRamBus.writeCmd.wayMask := ackToClearLock.tagWayMask
+
   val threadLogic = (0 until threads).map { thread =>
     new Area {
       val rob = Mem(RobItem(), oooLengthMax)
       val inSsn, ackSsn = Counter(ssnWidth bits)
       val threadDown = inSsn===ackSsn
       val robFull = inSsn-ackSsn < oooLengthMax
+
+      when(inSsn.willOverflow){
+        assert(False, "ssn overflow")
+      }
 
       val clear = cloneOf(io.ssnClear)
       val oooAck, sequentialAck = Stream(AckSpike())
@@ -671,7 +683,6 @@ class SpikeOrderCtrl extends Component {
 class CacheFlushCtrl extends Component {
   val io = new Bundle {
     val flush = slave(Stream(ThreadFlush()))
-    val ssnClear = master(Stream(UInt(log2Up(threads) bits)))
     val notSpikeInPath = in Bool()
     val stallSpikePath = out Bool()
     val tagRamBus = master(TagRamBus())
@@ -691,31 +702,23 @@ class CacheFlushCtrl extends Component {
 
   val fsm = new StateMachine{
     val idle = makeInstantEntry()
-    val clearSsn = new State
     val stallSpike = new State
     val lockTags = new State
     val tagRead = new State
     val bufferRsp = new State
-    val sendFlushSpike = new State
+    val sendFlushSpikes = new State
     val flushDone = new State
 
     val rspToLock = RegNext(this.isActive(lockTags))
     val rspToInvalidIsFree = Bool()
     io.flush.ready := False
-    io.ssnClear.valid := False
-    io.ssnClear.payload := io.flush.thread
     io.stallSpikePath := False
     io.tagRamBus.readCmd.valid := False
     io.tagRamBus.readCmd.payload := tagReadAddress
 
     idle
       .whenIsActive{
-        when(io.flush.valid){ goto(clearSsn) }
-      }
-    clearSsn
-      .whenIsActive{
-        when(io.ssnClear.ready){ goto(stallSpike) }
-        io.ssnClear.valid := True
+        when(io.flush.valid){ goto(stallSpike) }
       }
     stallSpike
       .whenIsActive{
@@ -736,8 +739,8 @@ class CacheFlushCtrl extends Component {
         tagWriteAddress := tagReadAddress
       }
     bufferRsp
-      .whenIsActive{ goto(sendFlushSpike) }
-    sendFlushSpike
+      .whenIsActive{ goto(sendFlushSpikes) }
+    sendFlushSpikes
       .whenIsActive{
         when(rspToInvalidIsFree){
           when(tagWriteAddress===tagWriteAddress.maxValue) {
@@ -814,13 +817,14 @@ class CacheFlushCtrl extends Component {
   }.addFragmentLast(True).takeWhen(invalidToCache.tag.dirty)
 }
 
-class CacheDataCtrl extends Component {
+class CacheCtrl extends Component {
   val io = new Bundle {
     val ackSpike = slave(Stream(AckSpike()))
     val metaSpike = slave(Stream(MetaSpikeT()))
     val missSpike = master(Stream(new MissSpike))
     val refractory = in UInt(tagTimeStampWidth bits)
     val flush = slave(Stream(ThreadFlush()))
+    val ssnClear = slave(Stream(UInt(log2Up(threads) bits)))
     val writeBackSpikeData = master(Stream(Fragment(MetaSpikeWithData())))
     val missSpikeData = slave(Stream(Fragment(MissSpikeWithData())))
     val readySpike = master(Stream(ReadySpike()))
@@ -835,6 +839,7 @@ class CacheDataCtrl extends Component {
 
   io.metaSpike >> spikeOrderCtrl.io.sequentialInSpike
   io.ackSpike  >> spikeOrderCtrl.io.oooAckSpike
+  io.ssnClear  >> spikeOrderCtrl.io.ssnClear
 
   val spikeWithSsn = StreamArbiterFactory.roundRobin.on(
     Seq(spikeOrderCtrl.io.metaSpikeWithSsn, rollBackSpikeFifo.io.pop)
@@ -858,7 +863,6 @@ class CacheDataCtrl extends Component {
   ).queue(cacheLines) //TODO: move this to readySpikeManagement if it's designed
 
   cacheFlushCtrl.io.flush          << io.flush
-  cacheFlushCtrl.io.ssnClear       >> spikeOrderCtrl.io.ssnClear
   cacheFlushCtrl.io.notSpikeInPath := spikeTagFilter.io.idle
 
   val tagRam = Seq.fill(wayCountPerStep)(
@@ -953,7 +957,7 @@ class CacheDataPacker extends Component {
 
 object CacheVerilog extends App {
   //SpinalVerilog(Axi4UramBank(64, 32 KiB, 2))
-  SpinalVerilog(new CacheDataCtrl)
+  SpinalVerilog(new CacheCtrl)
 }
 /*
 object Solution extends App{
@@ -986,4 +990,4 @@ object Solution extends App{
     (dp(nMax = n) % 1337).toInt
   }
 }
- */
+*/
