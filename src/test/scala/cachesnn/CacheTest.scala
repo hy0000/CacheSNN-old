@@ -399,7 +399,7 @@ case class SpikeDriver[T<:Data](port:Stream[T], clockDomain: ClockDomain){
   private var timeStamp = 0
 
   def setTimeStamp(t:Int): Unit ={
-    timeStamp = t
+    timeStamp = t & ((1<<tagTimeStampWidth)-1)
   }
 
   def send[S<:Spike](spikeSim:SpikeSim): Unit ={
@@ -440,6 +440,11 @@ case class SpikeDriver[T<:Data](port:Stream[T], clockDomain: ClockDomain){
   def send(spikeSimSeq:Seq[SpikeSim]): Unit ={
     for(spikeSim <- spikeSimSeq){
       send(spikeSim)
+    }
+  }
+  def waitSendOver(): Unit ={
+    while(spikeQueue.nonEmpty){
+      clockDomain.waitRisingEdge()
     }
   }
 }
@@ -664,22 +669,28 @@ class SpikeOrderCtrlTest extends AnyFunSuite {
     private val (minAckDelay, maxAckDelay) = (64, 2048)
     private val oooAckSpikeQueue = mutable.Queue[SpikeSim]()
     private val ackedSpikeQueue = mutable.Queue[SpikeSim]()
+    private val targetSsn = Array.fill(threads)(0)
 
-    dut.io.ssnClear.valid #= false
-
+    StreamMonitor(dut.io.sequentialInSpike, dut.clockDomain){spike =>
+      val thread = spike.thread.toInt
+      spikeMonitorQueue(thread).enqueue(SpikeSim(spike))
+    }
+    dut.io.metaSpikeWithSsn.ready #= true
     StreamMonitor(dut.io.metaSpikeWithSsn, dut.clockDomain){spike=>
       val thread = spike.thread.toInt
       val targetSpike = spikeMonitorQueue(thread).dequeue()
       assert(spike.nid.toInt==targetSpike.nid)
-      assert(spike.ssn.toInt==targetSpike.ssn)
-      oooAckSpikeQueue.enqueue(targetSpike)
+      assert(spike.ssn.toInt==targetSsn(thread))
+      oooAckSpikeQueue.enqueue(targetSpike.copy(ssn=targetSsn(thread)))
+      val nextSsn = targetSsn(thread) + 1
+      targetSsn(thread) = if(nextSsn==oooLengthMax) 0 else nextSsn
     }
 
-    def getDelay:Int = ((1-Random.nextGaussian())*(maxAckDelay-minAckDelay)).abs.ceil.toInt+minAckDelay-1
+    var getDelay = () => ((1-Random.nextGaussian())*(maxAckDelay-minAckDelay)).abs.ceil.toInt+minAckDelay-1
 
     case class AckSpike(spike:SpikeSim = SpikeSim(0), valid:Boolean=false)
 
-    fork{
+    val ackThread = fork{
       var currentTime = 0
       val seqAckQueue = Array.fill(maxAckDelay)(AckSpike())
       while(true){
@@ -694,7 +705,7 @@ class SpikeOrderCtrlTest extends AnyFunSuite {
         }
 
         // delay a spike for ack
-        val delayedTime = (currentTime + getDelay) % maxAckDelay
+        val delayedTime = (currentTime + getDelay()) % maxAckDelay
         var successDelay = false
         if(oooAckSpikeQueue.nonEmpty){
           val spikeForDelay = oooAckSpikeQueue.dequeue()
@@ -710,30 +721,104 @@ class SpikeOrderCtrlTest extends AnyFunSuite {
       }
     }
 
-    def waitAllAck(spike:Seq[SpikeSim]): Unit ={
-
+    def waitThreadDone(thread:Int): Unit ={
+      dut.clockDomain.waitSamplingWhere(
+        dut.io.threadDone(thread).toBoolean
+      )
     }
   }
 
-  test("ssn test"){
+  test("ack snn in valid range assertion 1"){
+    intercept[Throwable]{
+      SimConfig.compile(new SpikeOrderCtrl).doSim{ dut =>
+        dut.clockDomain.forkStimulus(2)
+        SimTimeout(100000)
+        val driver = SpikeOrderCtrlDrivers(dut)
+        driver.ackThread.terminate()
+        driver.inSpikeDriver.send(SpikeSim(1))
+        driver.inSpikeDriver.waitSendOver()
+        dut.clockDomain.waitRisingEdge()
+        dut.io.oooAckSpike.valid #= true
+        dut.io.oooAckSpike.thread #= 0
+        dut.io.oooAckSpike.ssn #= 2
+        dut.clockDomain.waitRisingEdge(2)
+      }
+    }
+  }
+  test("ack snn in valid range assertion 2"){
+    intercept[Throwable]{
+      SimConfig.compile(new SpikeOrderCtrl).doSim{ dut =>
+        dut.clockDomain.forkStimulus(2)
+        SimTimeout(100000)
+        val driver = SpikeOrderCtrlDrivers(dut)
+        driver.inSpikeDriver.send((0 until oooLengthMax/2).map(nid => SpikeSim(nid)))
+        driver.inSpikeDriver.waitSendOver()
+        driver.waitThreadDone(0)
+        driver.inSpikeDriver.send((oooLengthMax/2 until oooLengthMax).map(nid => SpikeSim(nid)))
+        driver.inSpikeDriver.waitSendOver()
+        driver.ackSpikeDriver.send(SpikeSim(0, ssn = oooLengthMax/4))
+        driver.ackSpikeDriver.waitSendOver()
+        dut.clockDomain.waitRisingEdge(2)
+      }
+    }
+  }
+  test("illegal ack when rob empty"){
+    intercept[Throwable]{
+      SimConfig.compile(new SpikeOrderCtrl).doSim{ dut =>
+        dut.clockDomain.forkStimulus(2)
+        SimTimeout(100000)
+        SpikeOrderCtrlDrivers(dut)
+        dut.io.oooAckSpike.valid #= true
+        dut.io.oooAckSpike.ssn #= 2
+        dut.clockDomain.waitRisingEdge(2)
+      }
+    }
+  }
+  test("sequential ack test"){
     compiled.doSim{dut =>
       dut.clockDomain.forkStimulus(2)
-      SimTimeout(10000)
+      SimTimeout(100000)
+      val driver = SpikeOrderCtrlDrivers(dut)
+      driver.getDelay = () => 1
+      import driver.inSpikeDriver
+      val spikes = (0 until neuronSize).map(nid => SpikeSim(nid))
+      inSpikeDriver.send(spikes)
+      inSpikeDriver.waitSendOver()
+      driver.waitThreadDone(0)
+    }
+  }
+  test("ooo ack test"){
+    compiled.doSim{dut =>
+      dut.clockDomain.forkStimulus(2)
+      SimTimeout(100000)
       val driver = SpikeOrderCtrlDrivers(dut)
       import driver.inSpikeDriver
       val spikes = (0 until neuronSize).map(nid => SpikeSim(nid))
       inSpikeDriver.send(spikes)
-      dut.clockDomain.waitRisingEdge(1000)
+      inSpikeDriver.waitSendOver()
+      driver.waitThreadDone(0)
     }
   }
-  test("ssn clear test"){
-
-  }
-  test("ooo ack test"){
-
-  }
   test("thread parallel test"){
-
+    compiled.doSim{dut =>
+      dut.clockDomain.forkStimulus(2)
+      SimTimeout(10000000)
+      val driver = SpikeOrderCtrlDrivers(dut)
+      import driver.inSpikeDriver
+      StreamReadyRandomizer(dut.io.metaSpikeWithSsn, dut.clockDomain)
+      for(t <- 0 until 256){
+        inSpikeDriver.setTimeStamp(t)
+        for(thread <- 0 until threads){
+          inSpikeDriver.setTimeStamp(t)
+          val spikes = Seq.fill(Random.nextInt(256))(SpikeSim(Random.nextInt(neuronSize), thread = thread))
+          inSpikeDriver.send(spikes)
+          inSpikeDriver.waitSendOver()
+        }
+        for(thread <- 0 until threads){
+          driver.waitThreadDone(thread)
+        }
+      }
+    }
   }
 }
 
@@ -972,8 +1057,18 @@ class CacheFlushCtrlTest extends AnyFunSuite {
     def assertLock(n:Int): Unit ={
       dut.clockDomain.waitSamplingWhere(dut.io.stallSpikePath.toBoolean)
       dut.clockDomain.waitSamplingWhere(!dut.io.stallSpikePath.toBoolean)
+      dut.clockDomain.waitSamplingWhere(
+        !dut.io.tagRamBus.writeCmd.valid.toBoolean
+      )
       assert(tagRam.wayLocked.sum==n, tagRam.wayLocked.mkString(","))
     }
+  }
+
+  def freeRunDut(dut:CacheFlushCtrl): Unit ={
+    dut.io.tagRamBus.readCmd.ready #= true
+    dut.io.tagRamBus.writeCmd.ready #= true
+    dut.io.notSpikeInPath #= true
+    dut.io.flushSpike.ready #= true
   }
 
   test("flush all"){
@@ -997,7 +1092,6 @@ class CacheFlushCtrlTest extends AnyFunSuite {
       assert(tagRam.wayOccupancy.sum==0, tagRam.wayOccupancy.mkString(","))
     }
   }
-
   test("flush threads"){
     complied.doSim{dut =>
       dut.clockDomain.forkStimulus(2)
@@ -1025,14 +1119,6 @@ class CacheFlushCtrlTest extends AnyFunSuite {
       assert(tagRam.wayOccupancy.sum==0, tagRam.wayOccupancy.mkString(","))
     }
   }
-
-  def freeRunDut(dut:CacheFlushCtrl): Unit ={
-    dut.io.tagRamBus.readCmd.ready #= true
-    dut.io.tagRamBus.writeCmd.ready #= true
-    dut.io.notSpikeInPath #= true
-    dut.io.flushSpike.ready #= true
-  }
-
   test("flush tagAccess no stall assertion"){
     intercept[Throwable]{
       SimConfig.compile(new CacheFlushCtrl).doSim{dut =>

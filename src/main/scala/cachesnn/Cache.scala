@@ -25,8 +25,8 @@ object Cache {
   val tagStep = wayCount/wayCountPerStep
   val bypassBufferItems = 8
   val tagRamAddressWidth = setIndexRange.size + log2Up(tagStep)
-  val ssnWidth = nidWidth + 1  // spike sequence number, the worst cast has max spike and max virtual spike
   val oooLengthMax = 128
+  val ssnWidth = log2Up(oooLengthMax)
   val cacheReadDelay = 3
 }
 
@@ -543,141 +543,95 @@ class SpikeOrderCtrl extends Component {
   val io = new Bundle {
     val sequentialInSpike = slave(Stream(MetaSpikeT()))
     val metaSpikeWithSsn = master(Stream(MetaSpikeT()))
-    val ssnClear = slave(Stream(UInt(log2Up(threads) bits)))
+    val threadDone = out Vec(Bool(), threads)
     val oooAckSpike = slave(Stream(AckSpike()))
     val tagRamBus = master(TagRamBus())
   }
 
   class RobItem extends Bundle {
     val ack = Bool()
-    val spike = AckSpike()
   }
   object RobItem {
     def apply() = new RobItem
-    def apply(ack:Bool, spike:AckSpike) = {
+    def apply(ack:Bool) = {
       val ret = new RobItem
       ret.ack := ack
-      ret.spike := spike
       ret
     }
   }
 
-  val (ackToClearLock, ackToSetAck) = StreamFork2(io.oooAckSpike)
-
-  io.tagRamBus.readCmd.arbitrationFrom(ackToClearLock)
-  io.tagRamBus.readCmd.payload := ackToClearLock.tagAddress
-  io.tagRamBus.writeCmd.wayMask := ackToClearLock.tagWayMask
-
   val threadLogic = (0 until threads).map { thread =>
     new Area {
-      val rob = Mem(RobItem(), oooLengthMax)
-      val inSsn, ackSsn = Counter(ssnWidth bits)
-      val threadDown = inSsn===ackSsn
-      val robFull = inSsn-ackSsn < oooLengthMax
+      val oooAck = Stream(AckSpike())
+      val spikeIn = Stream(MetaSpikeT())
 
-      when(inSsn.willOverflow){
-        assert(False, "ssn overflow")
+      val rob = Mem(RobItem(), oooLengthMax)
+      val inSsn = Counter(ssnWidth bits, spikeIn.fire)
+      val ackSsn = Counter(ssnWidth bits)
+      val robRisingOccupy = RegInit(False)
+      val ssnMatch = inSsn===ackSsn
+      val robFull = ssnMatch && robRisingOccupy
+      val robEmpty = ssnMatch && !robRisingOccupy
+      val timestampBuffer = RegNextWhen(spikeIn.tagTimeStamp, spikeIn.fire)
+
+      when(inSsn.willIncrement =/= ackSsn.willIncrement) {
+        robRisingOccupy := inSsn.willIncrement
       }
 
-      val clear = cloneOf(io.ssnClear)
-      val oooAck, sequentialAck = Stream(AckSpike())
-      val spikeIn = Stream(MetaSpikeT())
-      val spikeOut = spikeIn.haltWhen(robFull).transmuteWith{
+      when(oooAck.valid){
+        val inValidSsnRange = Bool()
+        when(inSsn>ackSsn){
+          inValidSsnRange := oooAck.ssn >= ackSsn && oooAck.ssn < inSsn
+        }otherwise{
+          inValidSsnRange := oooAck.ssn < inSsn || oooAck.ssn >= ackSsn
+        }
+        assert(inValidSsnRange, message = L"ssn=${oooAck.ssn} in ackSpike is invalid, inSSN=${inSsn.value} ackSSN=${ackSsn.value}")
+        assert(!robEmpty, message = "invalid ackSpike because rob is empty")
+      }
+
+      rob.write(inSsn,      RobItem(False), spikeIn.fire)
+      rob.write(oooAck.ssn, RobItem(True),  oooAck.fire)
+      val acked = rob.readAsync(ackSsn).ack
+      when(!robEmpty && acked){
+        ackSsn.increment()
+      }
+      io.threadDone(thread) := robEmpty
+
+      val spikeOut = spikeIn.haltWhen(robFull).translateWith{
         val ret = MetaSpikeT()
         ret.ssn := inSsn
         ret.assignUnassignedByName(spikeIn.payload)
         ret
       }
-      clear.ready := False
-      oooAck.ready := False
-      val readPort = rob.readSyncPort
-      val writePort = rob.writePort
-      readPort.cmd := readPort.cmd.getZero
-      writePort := writePort.getZero
-      sequentialAck.valid := False
-      sequentialAck.payload := readPort.rsp.spike
 
-      val fsm = new StateMachine{
-        val SsnAppend = new State with EntryPoint
-        val SsnAckSet = new State
-        val SsnAck = new State
-        val SsnClear = new State
-
-        SsnAppend
-          .whenIsActive{
-            when(clear.valid && threadDown){ goto(SsnClear) }
-            when(oooAck.valid){ goto(SsnAckSet) }
-            when(spikeIn.fire){
-              inSsn.increment()
-              writePort.valid := True
-              writePort.address := inSsn.resized
-              writePort.data := RobItem(False, AckSpike().getZero)
-            }
-          }
-
-        SsnClear
-          .whenIsActive{ goto(SsnAppend) }
-          .onEntry{
-            inSsn.clear()
-            ackSsn.clear()
-          }
-          .onExit{
-            clear.ready := True
-          }
-
-        SsnAckSet
-          .whenIsActive{ goto(SsnAck) }
-          .onEntry{
-            writePort.valid := True
-            writePort.address := oooAck.ssn.resized
-            writePort.data := RobItem(True, oooAck.payload)
-          }
-
-        SsnAck
-          .whenIsActive{
-            when(!readPort.rsp.ack || threadDown){
-              goto(SsnAppend)
-            }
-            sequentialAck.valid := True
-          }
-          .whenIsNext{
-            when(sequentialAck.ready){
-              ackSsn.increment()
-            }
-            readPort.cmd.valid := True
-            readPort.cmd.payload := ackSsn.resized
-          }
-          .onExit{
-            oooAck.ready := True
-          }
+      val tagFreeLock = oooAck.translateWith{
+        val ret = TagRamWriteCmd()
+        for(tag <- ret.tags){
+          tag.valid := True
+          tag.lock := False
+          tag.dirty := oooAck.dirty
+          tag.thread := oooAck.thread
+          tag.tag := oooAck.tag
+          tag.timeStamp := timestampBuffer
+        }
+        ret.wayMask := oooAck.tagWayMask
+        ret.address := oooAck.tagAddress
+        ret
       }
     }
   }
 
   val spikeInDe = StreamDemux(io.sequentialInSpike, io.sequentialInSpike.thread, threads)
   val spikeOooAckDe = StreamDemux(io.oooAckSpike, io.oooAckSpike.thread, threads)
-  val clearDe = StreamDemux(io.ssnClear, io.ssnClear.payload, threads)
   for(thread <- 0 until threads){
-    spikeInDe(thread)  >> threadLogic(thread).spikeIn
+    spikeInDe(thread) >> threadLogic(thread).spikeIn
     spikeOooAckDe(thread) >> threadLogic(thread).oooAck
-    clearDe(thread)    >> threadLogic(thread).clear
   }
-  io.metaSpikeWithSsn << StreamArbiterFactory.on(threadLogic.map(_.spikeOut))
-  val sequentialAck = StreamArbiterFactory.on(threadLogic.map(_.sequentialAck))
-  io.tagRamBus.readCmd.arbitrationFrom(sequentialAck)
-  io.tagRamBus.readCmd.payload := sequentialAck.tagAddress
-  val ackSpikeDelay = RegNextWhen(sequentialAck.payload, sequentialAck.ready)
-  io.tagRamBus.writeCmd.arbitrationFrom(io.tagRamBus.readRsp)
-  io.tagRamBus.writeCmd.address := ackSpikeDelay.tagAddress
-  io.tagRamBus.writeCmd.wayMask := ackSpikeDelay.tagWayMask
-  io.tagRamBus.writeCmd.tags := Vec(
-    io.tagRamBus.readRsp.payload.map{ tag =>
-      val ret = Tag()
-      ret.lock := False
-      ret.assignUnassignedByName(tag)
-      ret
-    }
-  )
+
+  io.metaSpikeWithSsn <-< StreamArbiterFactory.on(threadLogic.map(_.spikeOut))
+  io.tagRamBus.writeCmd <-< StreamArbiterFactory.on(threadLogic.map(_.tagFreeLock))
+  io.tagRamBus.readCmd.setIdle()
+  io.tagRamBus.readRsp.setBlocked()
 }
 
 class CacheFlushCtrl extends Component {
@@ -804,8 +758,8 @@ class CacheFlushCtrl extends Component {
     ret.wayMask := UIntToOh(invalidToTagRam.wayLow)
     ret
   }
-  io.tagRamBus.writeCmd << StreamArbiterFactory.on(Seq(lockTagRamWrite, invalidTagRamWrite))
-  io.flushSpike << invalidToCache.translateWith{
+  io.tagRamBus.writeCmd <-/< StreamArbiterFactory.on(Seq(lockTagRamWrite, invalidTagRamWrite))
+  io.flushSpike <-< invalidToCache.translateWith{
     val ret = cloneOf(io.flushSpike.fragment)
     ret.cacheAddressBase := (tagWriteAddress @@ invalidToCache.wayLow) << cacheLineAddrWidth
     ret.replaceSpike.len := io.flush.len
@@ -824,7 +778,7 @@ class CacheCtrl extends Component {
     val missSpike = master(Stream(new MissSpike))
     val refractory = in UInt(tagTimeStampWidth bits)
     val flush = slave(Stream(ThreadFlush()))
-    val ssnClear = slave(Stream(UInt(log2Up(threads) bits)))
+    val threadDone = out Vec(Bool(), threads)
     val writeBackSpikeData = master(Stream(Fragment(MetaSpikeWithData())))
     val missSpikeData = slave(Stream(Fragment(MissSpikeWithData())))
     val readySpike = master(Stream(ReadySpike()))
@@ -837,9 +791,9 @@ class CacheCtrl extends Component {
   val cacheFlushCtrl = new CacheFlushCtrl
   val rollBackSpikeFifo = StreamFifo(MetaSpikeT(), oooLengthMax-wayCount)
 
-  io.metaSpike >> spikeOrderCtrl.io.sequentialInSpike
-  io.ackSpike  >> spikeOrderCtrl.io.oooAckSpike
-  io.ssnClear  >> spikeOrderCtrl.io.ssnClear
+  io.metaSpike  >> spikeOrderCtrl.io.sequentialInSpike
+  io.ackSpike   >> spikeOrderCtrl.io.oooAckSpike
+  io.threadDone := spikeOrderCtrl.io.threadDone
 
   val spikeWithSsn = StreamArbiterFactory.roundRobin.on(
     Seq(spikeOrderCtrl.io.metaSpikeWithSsn, rollBackSpikeFifo.io.pop)
@@ -854,7 +808,7 @@ class CacheCtrl extends Component {
     Seq(cacheFlushCtrl.io.flushSpike, io.missSpikeData)
   )
 
-  missSpikeCtrl.io.missSpikeData      << missSpikeData
+  missSpikeCtrl.io.missSpikeData      </< missSpikeData
   missSpikeCtrl.io.writeBackSpikeData >> io.writeBackSpikeData
   missSpikeCtrl.io.cache              <> io.cache
 
