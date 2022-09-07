@@ -1,6 +1,6 @@
 package cachesnn
 
-
+/*
 import spinal.core._
 import spinal.lib._
 import cachesnn.AerBus._
@@ -115,7 +115,7 @@ class SpikesTable(p: BmbParameter, size:BigInt, isPost:Boolean) extends Componen
     ret
   }
 
-  val cmd = StreamArbiterFactory.lowerFirst.on(
+  val cmd = StreamArbiterFactory().lowerFirst.on(
     Seq(cmdFromBus, cmdFromQuery)
   )
 
@@ -167,7 +167,7 @@ class SpikesTable(p: BmbParameter, size:BigInt, isPost:Boolean) extends Componen
     spikeRam.writePortWithMask << writeBack.takeWhen(
       Seq(busWrite, queryInsert, update, insertOnly).map(_===writeBack.action).orR
     ).translateWith{
-      val ret = MemWriteCmdWithMask(spikeRam)
+      val ret = MemWriteCmdWithMask(spikeRam, writeBack.mask.getWidth)
       ret.mask := writeBack.mask
       ret.address := writeBack.address
       when(writeBack.action===queryInsert){
@@ -312,3 +312,4 @@ object StdpVerilog extends App {
   //SpinalVerilog(new SpikesTable(bmbParameter, 4 KiB, false))
   //SpinalVerilog(new BmbAtomicRam(Synapse.postParamBmbParameter, Synapse.postParamSize/Synapse.nPostParamRam))
 }
+ */

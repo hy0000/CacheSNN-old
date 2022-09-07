@@ -735,7 +735,7 @@ class CacheFlushCtrl extends Component {
     val tag = Tag()
     val wayLow = UInt(log2Up(wayCountPerStep) bits)
   }
-  val invalidSeqOut = StreamArbiterFactory.on(
+  val invalidSeqOut = StreamArbiterFactory().on(
     StreamFork(readRspDe.toInvalid, wayCountPerStep)
       .zipWithIndex
       .map{case (s, wayLow) =>
@@ -758,7 +758,7 @@ class CacheFlushCtrl extends Component {
     ret.wayMask := UIntToOh(invalidToTagRam.wayLow)
     ret
   }
-  io.tagRamBus.writeCmd <-/< StreamArbiterFactory.on(Seq(lockTagRamWrite, invalidTagRamWrite))
+  io.tagRamBus.writeCmd <-/< StreamArbiterFactory().on(Seq(lockTagRamWrite, invalidTagRamWrite))
   io.flushSpike <-< invalidToCache.translateWith{
     val ret = cloneOf(io.flushSpike.fragment)
     ret.cacheAddressBase := (tagWriteAddress @@ invalidToCache.wayLow) << cacheLineAddrWidth
@@ -795,7 +795,7 @@ class CacheCtrl extends Component {
   io.ackSpike   >> spikeOrderCtrl.io.oooAckSpike
   io.threadDone := spikeOrderCtrl.io.threadDone
 
-  val spikeWithSsn = StreamArbiterFactory.roundRobin.on(
+  val spikeWithSsn = StreamArbiterFactory().roundRobin.on(
     Seq(spikeOrderCtrl.io.metaSpikeWithSsn, rollBackSpikeFifo.io.pop)
   ).haltWhen(cacheFlushCtrl.io.stallSpikePath)
 
@@ -804,7 +804,7 @@ class CacheCtrl extends Component {
   spikeTagFilter.io.missSpike     >> io.missSpike
   spikeTagFilter.io.rollBackSpike >> rollBackSpikeFifo.io.push
 
-  val missSpikeData = StreamArbiterFactory.lowerFirst.on(
+  val missSpikeData = StreamArbiterFactory().lowerFirst.on(
     Seq(cacheFlushCtrl.io.flushSpike, io.missSpikeData)
   )
 
@@ -812,7 +812,7 @@ class CacheCtrl extends Component {
   missSpikeCtrl.io.writeBackSpikeData >> io.writeBackSpikeData
   missSpikeCtrl.io.cache              <> io.cache
 
-  io.readySpike << StreamArbiterFactory.roundRobin.on(
+  io.readySpike << StreamArbiterFactory().roundRobin.on(
     Seq(spikeTagFilter.io.readySpike, missSpikeCtrl.io.readySpike)
   ).queue(cacheLines) //TODO: move this to readySpikeManagement if it's designed
 
@@ -830,14 +830,14 @@ class CacheCtrl extends Component {
       spikeTagFilter.io.tagRamBus
     )
 
-    val writeCmd = StreamArbiterFactory.lowerFirst.on(
+    val writeCmd = StreamArbiterFactory().lowerFirst.on(
       tagRamBusPrioritySeq.map(_.writeCmd)
     ).toFlow
     for((tagRam, way) <- tagRam.zipWithIndex){
       tagRam.write(writeCmd.address, writeCmd.tags(way), writeCmd.wayMask(way))
     }
 
-    val readCmd = StreamArbiterFactory.lowerFirst.on(tagRamBusPrioritySeq.map(_.readCmd))
+    val readCmd = StreamArbiterFactory().lowerFirst.on(tagRamBusPrioritySeq.map(_.readCmd))
     // use head StreamRead instead of fork join all StreamRead
     val streamReadRsp = tagRam.head.streamReadSync(readCmd)
     val rsp = streamReadRsp.translateWith{
@@ -868,7 +868,7 @@ class CacheDataPacker extends Component {
   val spikeDispatch = new Area {
     val sel = cacheAddressToBankSel(io.input.cacheAddressBase)
     val scatterSpikes = StreamDemux(io.input, sel, nCacheBank).map(_.stage())
-    val noConflictSpike = StreamArbiterFactory.roundRobin.on(scatterSpikes)
+    val noConflictSpike = StreamArbiterFactory().roundRobin.on(scatterSpikes)
   }
 
   val (spikeToAxi, spikeToBuffer) = StreamFork2(spikeDispatch.noConflictSpike)
@@ -913,35 +913,3 @@ object CacheVerilog extends App {
   //SpinalVerilog(Axi4UramBank(64, 32 KiB, 2))
   SpinalVerilog(new CacheCtrl)
 }
-/*
-object Solution extends App{
-  case class Bg(find:Boolean, shu:BigInt)
-  def doBg(x:Int, y:Int): Bg={
-    val shu = x.toBigInt * y.toBigInt
-    val shuStr = shu.toString()
-    Bg(shuStr==shuStr.reverse, shu)
-  }
-  def dp(nMax:Int, n:Int=0, shu:BigInt=0):BigInt = {
-    if(n==nMax){
-      shu
-    }else{
-      var bg = Bg(find = false, shu)
-      val hh = 1<<n
-      val hl = 1<<(n-1)
-      for(y <- (hl until hh).reverse if !bg.find){
-        for(x1 <- (y until hh).reverse if !bg.find){
-          bg = doBg(x1, y)
-        }
-      }
-      for(y <- (1 until hl).reverse if !bg.find){
-        for(x2 <- (hl until hh).reverse if !bg.find){
-          bg = doBg(x2, y)
-        }
-      }
-    }
-  }
-  def largestPalindrome(n: Int): Int = {
-    (dp(nMax = n) % 1337).toInt
-  }
-}
-*/

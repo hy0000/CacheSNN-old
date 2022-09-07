@@ -11,6 +11,7 @@ import spinal.lib.bus.bmb.sim.BmbDriver
 import scala.collection.mutable
 import scala.util.Random
 
+/*
 object StdpTest {
   val spikesTableSize = 4 KiB
   val bmbParameter = BmbParameter(
@@ -374,3 +375,4 @@ class StdpEventGenTest extends AnyFunSuite {
     }
   }
 }
+ */
